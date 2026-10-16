@@ -1,0 +1,84 @@
+[build-system]
+requires = ["hatchling>=1.27"]  # PEP 639 license fields need 1.27
+build-backend = "hatchling.build"
+
+[project]
+name = "dhcpctl"
+version = "0.1.0"
+authors = [{ name = "jose-pr" }]
+description = "One interface to DHCP servers: arm a reservation on dnsmasq, Kea, ISC dhcpd or Windows DHCP, then remove or keep it."
+readme = "README.md"
+requires-python = ">=3.9"
+license = "MIT"
+license-files = ["LICENSE"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: System Administrators",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Operating System :: OS Independent",
+    "Topic :: System :: Networking",
+    "Topic :: System :: Systems Administration",
+    "Typing :: Typed",
+]
+dependencies = [
+    # MACAddress.format/hex and the address/network types every backend reads.
+    "netimps>=0.4.0,<0.5",
+    # dnsmasq's hosts/opts paths, local or a URI; the 0.1 series is the first
+    # with the `uripath` import name.
+    "pathapi>=0.1.0,<0.2",
+    "pathapi-uri>=0.1.0,<0.2",
+]
+
+[project.optional-dependencies]
+# One extra per backend dependency; each is imported only when a URI needs it.
+# dnsmasq needs nothing for a local server, and windhcp nothing over its local
+# or ssh transport (the system ssh client).
+kea = ["requests>=2.31,<3"]                    # kea:// and keas://
+dhcpd = ["pypureomapi>=0.8,<2"]                # dhcpd:// over OMAPI
+winrm = ["pywinrm>=0.5.0,<0.6"]                # windhcp://...?transport=winrm
+ssh = ["sftppath[uri,paramiko]>=0.1.0,<0.2"]   # dnsmasq paths over sftp://
+dev = [
+    # Every backend extra, so their tests run rather than skip.
+    "dhcpctl[kea,dhcpd,winrm,ssh]",
+    "black",
+    "build",
+    "pytest",
+]
+docs = [
+    # MkDocs 2 drops the plugin system mkdocstrings needs.
+    "mkdocs<2",
+    "mkdocs-material",
+    "mkdocstrings[python]",
+    # 12.2 made Highlight(md) required; mkdocstrings 1.0.6 (the newest on 3.10) omits it.
+    "pymdown-extensions<12.2; python_version < '3.11'",
+]
+
+[project.urls]
+Homepage = "https://github.com/jose-pr/dhcpctl/"
+Documentation = "https://jose-pr.github.io/dhcpctl/"
+Issues = "https://github.com/jose-pr/dhcpctl/issues"
+
+# Personal overrides (`*.local.*`) and agent config (`CLAUDE*`) never ship, even
+# from a tree without its .gitignore. Neither does the repo-root AGENTS.md: it
+# orients a contributor in a checkout. The API header an installed consumer
+# reads is src/dhcpctl/AGENTS.md, which does ship.
+[tool.hatch.build.targets.sdist]
+exclude = ["/.*", "/AGENTS.md", "*.local.*", "CLAUDE*"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/dhcpctl"]
+exclude = ["*.local.*", "CLAUDE*"]
+
+[tool.black]
+target-version = ["py39"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+filterwarnings = ["error"]
