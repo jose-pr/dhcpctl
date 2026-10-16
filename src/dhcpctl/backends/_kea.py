@@ -75,8 +75,8 @@ class KeaBackend(DHCPServer):
             import requests
         except ImportError as exc:  # pragma: no cover - only without the extra
             raise BackendUnavailableError(
-                "the Kea backend requires dhcpctl's 'kea' extra: "
-                "pip install dhcpctl[kea]"
+                "the Kea backend requires the 'kea' extra: "
+                "pip install pydhcpctl[kea]"
             ) from exc
 
         payload: Dict[str, Any] = {"command": command, "service": [self.service]}

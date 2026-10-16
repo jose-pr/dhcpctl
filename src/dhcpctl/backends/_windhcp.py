@@ -775,8 +775,8 @@ class WinDHCPBackend(DHCPServer):
             import winrm
         except ImportError as exc:  # pragma: no cover - only without the extra
             raise BackendUnavailableError(
-                "the Windows DHCP backend over WinRM requires dhcpctl's 'winrm' "
-                "extra: pip install dhcpctl[winrm]"
+                "the Windows DHCP backend over WinRM requires the 'winrm' "
+                "extra: pip install pydhcpctl[winrm]"
             ) from exc
 
         scheme = "https" if self.ssl else "http"

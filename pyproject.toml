@@ -3,7 +3,7 @@ requires = ["hatchling>=1.27"]  # PEP 639 license fields need 1.27
 build-backend = "hatchling.build"
 
 [project]
-name = "dhcpctl"
+name = "pydhcpctl"
 version = "0.1.0"
 authors = [{ name = "jose-pr" }]
 description = "One interface to DHCP servers: arm a reservation on dnsmasq, Kea, ISC dhcpd or Windows DHCP, then remove or keep it."
@@ -45,7 +45,7 @@ winrm = ["pywinrm>=0.5.0,<0.6"]                # windhcp://...?transport=winrm
 ssh = ["sftppath[uri,paramiko]>=0.1.0,<0.2"]   # dnsmasq paths over sftp://
 dev = [
     # Every backend extra, so their tests run rather than skip.
-    "dhcpctl[kea,dhcpd,winrm,ssh]",
+    "pydhcpctl[kea,dhcpd,winrm,ssh]",
     "black",
     "build",
     "pytest",

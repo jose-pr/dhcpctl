@@ -53,7 +53,7 @@ from .exceptions import (
 )
 
 try:
-    __version__ = version("dhcpctl")
+    __version__ = version("pydhcpctl")
 except PackageNotFoundError:  # pragma: no cover - running from a source tree
     __version__ = "0.0.0"
 

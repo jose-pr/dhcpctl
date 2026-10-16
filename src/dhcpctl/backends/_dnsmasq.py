@@ -281,8 +281,8 @@ def _require_sftp(uri: str) -> None:
         _util.find_spec("paramiko") is None and _util.find_spec("asyncssh") is None
     ):
         raise BackendUnavailableError(
-            "a remote dnsmasq path (sftp://) requires dhcpctl's 'ssh' extra: "
-            "pip install dhcpctl[ssh]"
+            "a remote dnsmasq path (sftp://) requires the 'ssh' extra: "
+            "pip install pydhcpctl[ssh]"
         )
 
 

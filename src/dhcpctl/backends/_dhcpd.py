@@ -105,8 +105,8 @@ class DHCPDBackend(DHCPServer):
             import pypureomapi
         except ImportError as exc:  # pragma: no cover - only without the extra
             raise BackendUnavailableError(
-                "the ISC dhcpd backend requires dhcpctl's 'dhcpd' extra: "
-                "pip install dhcpctl[dhcpd]"
+                "the ISC dhcpd backend requires the 'dhcpd' extra: "
+                "pip install pydhcpctl[dhcpd]"
             ) from exc
 
         secret = self._key()
