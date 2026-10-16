@@ -1,0 +1,52 @@
+site_name: dhcpctl
+site_description: One interface to DHCP servers - arm a reservation on dnsmasq, Kea, ISC dhcpd or Windows DHCP, then remove or keep it.
+site_url: https://jose-pr.github.io/dhcpctl/
+repo_url: https://github.com/jose-pr/dhcpctl
+repo_name: jose-pr/dhcpctl
+edit_uri: edit/main/docs/
+
+# Only docs/ is scanned: with pymdownx.snippets reading from the repository
+# root, a strict build would otherwise warn about repo-level markdown that is
+# not in the nav.
+docs_dir: docs
+
+theme:
+  name: material
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+  features:
+    - navigation.sections
+    - content.code.copy
+
+nav:
+  - Home: index.md
+  - Backends: backends.md
+  - API Reference:
+      - Overview: api/reference.md
+  - Changelog: changelog.md
+
+plugins:
+  - search
+  - mkdocstrings:
+      handlers:
+        python:
+          options:
+            show_source: true
+            show_root_heading: true
+            merge_init_into_class: true
+
+markdown_extensions:
+  - admonition
+  - tables
+  - pymdownx.snippets:
+      base_path: ["."]
+  - pymdownx.superfences
