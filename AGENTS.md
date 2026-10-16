@@ -1,5 +1,8 @@
 # dhcpctl — working in this checkout
 
+The distribution is **`pydhcpctl`** (`dhcpctl` was taken on PyPI); the import
+package, and any command line, is **`dhcpctl`**.
+
 | Shipped header | Covers |
 | --- | --- |
 | [`src/dhcpctl/AGENTS.md`](src/dhcpctl/AGENTS.md) | the public API; it ships in the wheel |

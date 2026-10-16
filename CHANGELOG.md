@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- Published as `pydhcpctl`; the import package is `dhcpctl`.
 - `connect(uri, *, secrets=None, owner="dhcpctl")`, `register_backend`,
   `unregister_backend`, `backend_names`, `get_backend` and the
   `dhcpctl.backends` entry-point group.

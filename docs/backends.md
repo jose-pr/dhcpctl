@@ -8,10 +8,10 @@ in a URI and belongs in the reservation.
 
 | Scheme | Server | How it applies a reservation | Install |
 | --- | --- | --- | --- |
-| `dnsmasq://` | dnsmasq | writes `dhcp-host` / `dhcp-option` files, local or over `sftp://` | nothing locally; `dhcpctl[ssh]` for remote paths |
-| `kea://`, `keas://` | ISC Kea | `reservation-add` / `reservation-del` via the control agent | `dhcpctl[kea]` |
-| `dhcpd://` | ISC dhcpd | an OMAPI host object | `dhcpctl[dhcpd]` |
-| `windhcp://` | Windows DHCP | its PowerShell cmdlets *or* `netsh`, locally, over ssh or WinRM | nothing locally or over ssh; `dhcpctl[winrm]` for WinRM |
+| `dnsmasq://` | dnsmasq | writes `dhcp-host` / `dhcp-option` files, local or over `sftp://` | nothing locally; `pydhcpctl[ssh]` for remote paths |
+| `kea://`, `keas://` | ISC Kea | `reservation-add` / `reservation-del` via the control agent | `pydhcpctl[kea]` |
+| `dhcpd://` | ISC dhcpd | an OMAPI host object | `pydhcpctl[dhcpd]` |
+| `windhcp://` | Windows DHCP | its PowerShell cmdlets *or* `netsh`, locally, over ssh or WinRM | nothing locally or over ssh; `pydhcpctl[winrm]` for WinRM |
 
 ## What is easy to get wrong
 

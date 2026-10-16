@@ -1,7 +1,7 @@
 # dhcpctl
 
-[![Version](https://img.shields.io/pypi/v/dhcpctl.svg)](https://pypi.org/project/dhcpctl/)
-[![Python versions](https://img.shields.io/pypi/pyversions/dhcpctl.svg)](https://pypi.org/project/dhcpctl/)
+[![Version](https://img.shields.io/pypi/v/pydhcpctl.svg)](https://pypi.org/project/pydhcpctl/)
+[![Python versions](https://img.shields.io/pypi/pyversions/pydhcpctl.svg)](https://pypi.org/project/pydhcpctl/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/jose-pr/dhcpctl/blob/main/LICENSE)
 [![Docs](https://img.shields.io/badge/docs-latest-blue.svg)](https://jose-pr.github.io/dhcpctl/)
 [![CI](https://img.shields.io/github/actions/workflow/status/jose-pr/dhcpctl/test.yml)](https://github.com/jose-pr/dhcpctl/actions/workflows/test.yml)
@@ -38,15 +38,17 @@ Documentation: <https://jose-pr.github.io/dhcpctl/>.
 ## Installation
 
 ```bash
-pip install dhcpctl
+pip install pydhcpctl
 ```
+
+The distribution is `pydhcpctl`; the import package is `dhcpctl`.
 
 | Scheme | Server | Install |
 | --- | --- | --- |
-| `dnsmasq://` | dnsmasq | nothing locally; `dhcpctl[ssh]` for `sftp://` paths |
-| `kea://`, `keas://` | ISC Kea control agent | `dhcpctl[kea]` (requests) |
-| `dhcpd://` | ISC dhcpd over OMAPI | `dhcpctl[dhcpd]` (pypureomapi) |
-| `windhcp://` | Windows DHCP | nothing locally or over ssh; `dhcpctl[winrm]` (pywinrm) |
+| `dnsmasq://` | dnsmasq | nothing locally; `pydhcpctl[ssh]` for `sftp://` paths |
+| `kea://`, `keas://` | ISC Kea control agent | `pydhcpctl[kea]` (requests) |
+| `dhcpd://` | ISC dhcpd over OMAPI | `pydhcpctl[dhcpd]` (pypureomapi) |
+| `windhcp://` | Windows DHCP | nothing locally or over ssh; `pydhcpctl[winrm]` (pywinrm) |
 
 Python 3.9 or later.
 

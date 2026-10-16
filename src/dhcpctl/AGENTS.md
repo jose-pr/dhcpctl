@@ -10,12 +10,12 @@ Every public name is importable from `dhcpctl`; `dhcpctl.exceptions` and
 `dhcpctl.backends` (the four backend classes, imported lazily) are public too.
 Modules whose name starts with an underscore are private.
 
-`pip install dhcpctl` needs `netimps`, `pathapi` and `pathapi-uri`. Each
+`pip install pydhcpctl` (the distribution; the import package is `dhcpctl`) needs `netimps`, `pathapi` and `pathapi-uri`. Each
 backend's library is an extra, imported only when a URI with its scheme is
 first **used** (building a server needs none): `kea` (requests), `dhcpd`
 (pypureomapi), `winrm` (pywinrm), `ssh` (sftppath with paramiko, for dnsmasq
 `sftp://` paths). A missing one raises `BackendUnavailableError` naming
-`dhcpctl[<extra>]`. `dhcpctl.__version__` is the installed version. Python 3.9+.
+`pydhcpctl[<extra>]`. `dhcpctl.__version__` is the installed distribution's version. Python 3.9+.
 
 ## Connecting (`dhcpctl`)
 
