@@ -70,6 +70,33 @@ jobs:
       - name: Run tests
         run: python -m pytest -q -rs
 
+  # The dnsmasq and dhcpd backends against a real dnsmasq, a real ISC dhcpd
+  # and a real DHCP client, in network namespaces the tests make for
+  # themselves. Required here: a missing peer fails the job rather than
+  # skipping.
+  real-peers:
+    name: Real DHCP peers (dnsmasq, dhcpd)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
+      - name: Install dnsmasq and a DHCP client
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y dnsmasq-base isc-dhcp-server udhcpc
+          # Ubuntu confines unprivileged user namespaces with AppArmor.
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+      - name: Install package with all extras
+        run: python -m pip install -e ".[dev]"
+      - name: Run the real-peer tests
+        env:
+          DHCPCTL_REQUIRE_PEERS: "1"
+        run: python -m pytest -q -rs tests/test_dnsmasq_real.py tests/test_dhcpd_real.py
+
   # What a user installs is the wheel: build it, install it bare and with
   # every backend extra into fresh environments, on each OS.
   wheel-smoke:
