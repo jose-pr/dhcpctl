@@ -5,7 +5,9 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
-## [0.1.0] - Unreleased
+## [Unreleased]
+
+## [0.1.0] - 2026-10-19
 
 ### Added
 
@@ -135,5 +137,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   reservation does, rather than as option 67.
 - Errors under `DHCPCtlError`: `ConfigError`, `UnknownBackendError`,
   `BackendUnavailableError`, `MissingMACError`, `ServerError`,
-  `ReservationExistsError`, `ConditionUnsupportedError`,
-  `ConditionMissingError`.
+  `ConditionUnsupportedError`, `ConditionMissingError`.
+
+[Unreleased]: https://github.com/jose-pr/dhcpctl/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/jose-pr/dhcpctl/releases/tag/v0.1.0
