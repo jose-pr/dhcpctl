@@ -126,7 +126,8 @@ def test_arm_keep_and_remove_reach_the_client(tmp_path, mode):
     # Kept: the address and router stay, the boot file is the completion's,
     # and the condition is gone with the installer's boot file.
     assert kept["ip"] == "10.0.0.10" and kept["router"] == "10.0.0.1"
-    assert kept["boot_file"] == "sanboot.ipxe" and "siaddr" not in kept
+    # The next server is gone; some udhcpc builds report dhcpd's own address.
+    assert kept["boot_file"] == "sanboot.ipxe" and kept.get("siaddr") != "10.0.0.2"
     assert removed.get("ip") != "10.0.0.10" and "boot_file" not in removed
 
 

@@ -46,7 +46,8 @@ dependencies = [
 [project.optional-dependencies]
 # One extra per backend dependency; each is imported only when a URI needs it.
 # dnsmasq needs nothing for a local server, and windhcp nothing locally.
-kea = ["requests>=2.31,<3"]                    # kea:// and keas://
+# 2.32.3: hostctl[winrm] needs it, so the floors resolve together.
+kea = ["requests>=2.32.3,<3"]                  # kea:// and keas://
 dhcpd = ["pypureomapi>=0.8,<2"]                # dhcpd:// over OMAPI
 winrm = ["hostctl[winrm]>=0.4.0,<0.5"]         # windhcp://...?transport=winrm
 # windhcp over ssh, and a remote dnsmasq: its sftp:// paths and its reload.
