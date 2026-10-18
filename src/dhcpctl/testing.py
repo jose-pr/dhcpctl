@@ -28,6 +28,7 @@ from ._model import Reservation, Scope, Target
 from ._registry import connect
 from ._server import DHCPServer
 from .exceptions import (
+    BackendUnavailableError,
     ConditionUnsupportedError,
     ConfigError,
     MissingMACError,
@@ -85,7 +86,10 @@ class BackendContract:
     def test_a_password_in_the_uri_is_never_shown(self) -> None:
         if self.secret_uri is None:
             pytest.skip("the backend's URI takes no password")
-        server = connect(self.secret_uri.format(secret=SECRET))
+        try:
+            server = connect(self.secret_uri.format(secret=SECRET))
+        except BackendUnavailableError as exc:
+            pytest.skip(f"the secret URI needs an extra: {exc}")
         for shown in (str(server), repr(server), server.redacted_uri):
             assert SECRET not in shown
 
