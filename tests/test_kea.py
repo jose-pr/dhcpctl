@@ -176,14 +176,14 @@ def test_every_step_of_a_rewrite_is_checked(kea_server, lan, failing):
         server.keep(lan(completion={"keep": True}))
 
 
-def test_detaching_a_class_rewrites_the_reservation_and_checks_it(kea_server, lan):
+def test_leaving_a_condition_checks_each_class_del(kea_server, lan):
     server, fake = kea_server(
-        "kea://k/", {"reservation-update": {"result": 1, "text": "no such host"}}
+        "kea://k/", {"class-del": {"result": 1, "text": "class is in use"}}
     )
     condition = dhcpctl.parse_conditions(
         {"ipxe": {"match": {"user-class": "iPXE"}, "options": {"file": "b"}}}, "t"
     )["ipxe"]
-    with pytest.raises(dhcpctl.ServerError, match="no such host"):
+    with pytest.raises(dhcpctl.ServerError, match="class is in use"):
         server.remove_condition_member(lan(), condition)
 
 
@@ -259,17 +259,16 @@ def test_an_unsupported_result_explains_the_usual_cause(kea_server, lan):
 
 
 @pytest.mark.parametrize("owner", ["dhcpctl", "netboot"])
-def test_an_existing_reservation_is_refused_not_overwritten(kea_server, lan, owner):
-    server, _ = kea_server(
+def test_re_arming_replaces_the_reservation_kea_holds(kea_server, lan, owner):
+    server, fake = kea_server(
         replies={
             "reservation-add": {"result": 1, "text": "database exists error"},
         },
         owner=owner,
     )
-    with pytest.raises(
-        dhcpctl.ReservationExistsError, match=f"{owner} does not overwrite"
-    ):
-        server.add(lan())
+    server.add(lan())
+    assert fake.commands() == ["reservation-add", "reservation-update"]
+    assert fake.posted[1][1]["arguments"]["reservation"]["ip-address"] == "10.0.0.10"
 
 
 def test_another_result_1_is_a_plain_server_error(kea_server, lan):
@@ -278,7 +277,7 @@ def test_another_result_1_is_a_plain_server_error(kea_server, lan):
     )
     with pytest.raises(dhcpctl.ServerError) as excinfo:
         server.add(lan())
-    assert not isinstance(excinfo.value, dhcpctl.ReservationExistsError)
+    assert "bad address" in str(excinfo.value)
 
 
 def test_the_subnet_id_is_discovered_from_the_scope_network(kea_server, reservation):
@@ -391,3 +390,16 @@ def test_kea_appends_an_extra_it_does_not_check(kea_server, lan):
     server.add(lan(server, extras={"add": ["not-a-real-option"]}))
     reservation = fake.posted[0][1]["arguments"]["reservation"]
     assert "not-a-real-option" in reservation["option-data"]
+
+
+def test_octets_and_flags_reach_kea_in_a_form_it_reads():
+    from dhcpctl.backends._kea import _option_data
+
+    lease = dhcpctl.PYDHCP_CODES.lease(
+        {"option-224": "0a0b", "ip-forwarding": True, "time-offset": -3600}
+    )
+    data = {int(k): _option_data(k, v) for k, v in dhcpctl.plain_items(lease.options)}
+    # No definition is needed for octets with csv-format off.
+    assert data[224] == {"code": 224, "csv-format": False, "data": "0a0b"}
+    assert data[19] == {"code": 19, "data": "true"}
+    assert data[2] == {"code": 2, "data": "-3600"}

@@ -147,7 +147,9 @@ def test_the_generated_script_runs_and_passes_each_argument_separately(tmp_path)
     # multi-valued option really is two addresses and not one token.
     verdict, calls = _run(tmp_path, _script("windhcp://dhcp01/?method=netsh"))
     assert verdict == "OK"
-    assert calls[0][:6] == [
+    # Re-arming first deletes the client's reservation, if any.
+    assert calls[0][4:6] == ["delete", "reservedip"]
+    assert calls[1][:6] == [
         "dhcp",
         "server",
         "scope",
@@ -169,12 +171,12 @@ def test_a_remote_server_reaches_netsh_as_one_unc_argument(tmp_path):
 
 def test_a_failing_netsh_call_aborts_the_run_naming_the_command(tmp_path):
     verdict, calls = _run(
-        tmp_path, _script("windhcp://dhcp01/?method=netsh"), fail_at=1
+        tmp_path, _script("windhcp://dhcp01/?method=netsh"), fail_at=2
     )
     assert verdict.startswith("THREW")
     assert "set reservedoptionvalue" in verdict and "failed (1)" in verdict
     # It stops there rather than carrying on with a half-applied reservation.
-    assert len(calls) == 2
+    assert len(calls) == 3
 
 
 def test_a_failing_delete_is_tolerated_so_cleanup_can_rerun(tmp_path):
@@ -194,7 +196,7 @@ def test_a_hostile_value_arrives_as_one_argument_and_runs_nothing(tmp_path):
     script = _script("windhcp://dhcp01/?method=netsh", name=hostile)
     verdict, calls = _run(tmp_path, script)
     assert verdict == "OK"
-    assert hostile in calls[0]
+    assert hostile in calls[1]
 
 
 def test_the_cmdlet_script_also_parses_and_runs(tmp_path):
@@ -202,6 +204,8 @@ def test_the_cmdlet_script_also_parses_and_runs(tmp_path):
     # is about the script being valid PowerShell and the payload parsing.
     script = _script("windhcp://dhcp01/")
     harness = (
+        "function Get-DhcpServerv4Reservation { }\n"
+        "function Remove-DhcpServerv4Reservation { }\n"
         "function Add-DhcpServerv4Reservation { }\n"
         "function Set-DhcpServerv4OptionValue { }\n"
     ) + script

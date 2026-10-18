@@ -114,3 +114,64 @@ def reservation():
 def ipxe():
     """The `ipxe` condition, parsed."""
     return dhcpctl.parse_conditions(IPXE, "test")["ipxe"]
+
+
+#: One option of each value type a reservation carries, and what busybox
+#: udhcpc reports for it, for the real-peer tests: (name, value, code, udhcpc variable, expected).
+VALUE_TYPES = [
+    # busybox prints option 2 unsigned: these are the octets of -3600.
+    ("time-offset", -3600, 2, "timezone", str(-3600 % 2**32)),  # I32
+    ("ip-forwarding", True, 19, "opt19", "01"),  # Boolean
+    ("ip-ttl", 64, 23, "ipttl", "64"),  # U8
+    ("interface-mtu", 1500, 26, "mtu", "1500"),  # U16
+    ("ntp-servers", ["10.0.0.3", "10.0.0.4"], 42, "ntpsrv", "10.0.0.3 10.0.0.4"),
+    ("domain-name", "example.com", 15, "domain", "example.com"),  # String
+    (
+        "domain-search",
+        ["example.com", "lab.example.com"],
+        119,
+        "search",
+        "example.com lab.example.com",
+    ),  # DomainList
+    ("option-224", "0a0b", 224, "opt224", "0a0b"),  # Bytes, as hex
+]
+
+
+@pytest.fixture
+def value_types():
+    """`VALUE_TYPES`: (name, value, code, udhcpc variable, expected)."""
+    return VALUE_TYPES
+
+
+#: A value of each pydhcp codec simple enough to write in a config, for the
+#: tests that send every option through a real server.
+_SAMPLES = {
+    "Bytes": "0a0b",
+    "List[IPv4AddressOption]": ["10.0.0.1", "10.0.0.2"],
+    "String": "x y",
+    "U32": 600,
+    "Boolean": True,
+    "IPv4AddressOption": "10.0.0.1",
+    "U8": 7,
+    "U16": 1500,
+    "List[U16]": [576, 1500],
+    "DomainList": ["example.com", "lab.example.com"],
+    "DomainName": "example.com",
+    "I32": -3600,
+    "OctetString": "PXEClient",
+    "List[U8]": [1, 2],
+}
+
+
+@pytest.fixture
+def every_option():
+    """(code, value) for every pydhcp option with a codec `_SAMPLES` covers."""
+    from pydhcp import DHCPOptionCode
+
+    found = []
+    for code in DHCPOptionCode:
+        codec = code.get_type()
+        name = getattr(codec, "__name__", str(codec))
+        if int(code) not in (0, 255) and name in _SAMPLES:
+            found.append((int(code), _SAMPLES[name]))
+    return found

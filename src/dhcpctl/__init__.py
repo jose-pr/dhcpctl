@@ -51,7 +51,6 @@ from .exceptions import (
     ConfigError,
     DHCPCtlError,
     MissingMACError,
-    ReservationExistsError,
     ServerError,
     UnknownBackendError,
 )
@@ -105,7 +104,6 @@ __all__ = [
     "BackendUnavailableError",
     "MissingMACError",
     "ServerError",
-    "ReservationExistsError",
     "ConditionUnsupportedError",
     "ConditionMissingError",
 ]

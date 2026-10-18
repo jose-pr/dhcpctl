@@ -116,12 +116,10 @@ def test_the_error_types_are_one_family():
         dhcpctl.BackendUnavailableError,
         dhcpctl.MissingMACError,
         dhcpctl.ServerError,
-        dhcpctl.ReservationExistsError,
         dhcpctl.ConditionUnsupportedError,
         dhcpctl.ConditionMissingError,
     ):
         assert issubclass(error, dhcpctl.DHCPCtlError)
-    assert issubclass(dhcpctl.ReservationExistsError, dhcpctl.ServerError)
     assert issubclass(dhcpctl.MissingMACError, LookupError)
 
 

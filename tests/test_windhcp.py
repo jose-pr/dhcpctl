@@ -6,14 +6,11 @@ the JSON payload inside it -- including with values that try to break out of it.
 
 import json
 import subprocess
-import sys
-import types
 
 import pytest
 
 import dhcpctl
 from dhcpctl.backends import WinDHCPBackend
-from dhcpctl.backends._windhcp import POWERSHELL_ARGV
 
 #: What the scope implies for every client in it.
 LAN = {"router": "10.0.0.1"}
@@ -59,6 +56,39 @@ class _Completed:
         self.returncode = returncode
         self.stdout = stdout
         self.stderr = stderr
+
+
+@pytest.fixture
+def hosts(monkeypatch):
+    """hostctl hosts the backend opens, recorded: each `(config, script)`.
+
+    `hosts.result` is what every run returns; set `hosts.error` to raise it.
+    """
+
+    class _Hosts(list):
+        result = _Completed()
+        error = None
+
+    opened = _Hosts()
+
+    class _Host:
+        def __init__(self, config):
+            self.config = config
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def run(self, script, **kwargs):
+            opened.append((self.config, script))
+            if opened.error is not None:
+                raise opened.error
+            return opened.result
+
+    monkeypatch.setattr("dhcpctl.backends._windhcp._open_host", _Host)
+    return opened
 
 
 def test_connect_picks_the_windhcp_backend():
@@ -156,33 +186,25 @@ def test_a_scope_with_neither_network_nor_id_is_refused(stub, lan):
     assert ran == []
 
 
-def test_ssh_is_the_default_transport_and_builds_its_argv(monkeypatch, lan):
+def test_ssh_is_the_default_transport_through_hostctl(hosts, lan):
+    import hostctl
+    from hostctl.shell import POWERSHELL
+
     server = dhcpctl.connect("windhcp://admin@dhcp01/?port=2222")
     assert server.transport == "ssh"
-    recorded = {}
-
-    def fake_run(argv, input=None, **kwargs):
-        recorded["argv"] = argv
-        recorded["input"] = input
-        return _Completed()
-
-    monkeypatch.setattr("dhcpctl.backends._windhcp._subprocess.run", fake_run)
     server.add(lan())
-    assert recorded["argv"][:4] == ["ssh", "-p", "2222", "admin@dhcp01"]
-    assert recorded["argv"][4:] == list(POWERSHELL_ARGV)
-    assert "Add-DhcpServerv4Reservation" in recorded["input"]
+    ((config, script),) = hosts
+    assert isinstance(config, hostctl.SSHConfig)
+    assert (config.host, config.port, config.username) == ("dhcp01", 2222, "admin")
+    assert config.shell is POWERSHELL
+    assert "Add-DhcpServerv4Reservation" in script
 
 
-def test_the_user_secret_fills_in_for_a_uri_without_one(monkeypatch, lan):
+def test_the_user_secret_fills_in_for_a_uri_without_one(hosts, lan):
     server = dhcpctl.connect("windhcp://dhcp01/", secrets={"user": "svc-dhcp"})
     assert server.user == "svc-dhcp"
-    argvs = []
-    monkeypatch.setattr(
-        "dhcpctl.backends._windhcp._subprocess.run",
-        lambda argv, **kwargs: argvs.append(argv) or _Completed(),
-    )
     server.add(lan())
-    assert argvs[0][:4] == ["ssh", "-p", "22", "svc-dhcp@dhcp01"]
+    assert hosts[0][0].username == "svc-dhcp"
 
 
 def test_the_secret_user_overrides_the_uris():
@@ -191,86 +213,66 @@ def test_the_secret_user_overrides_the_uris():
     assert dhcpctl.connect("windhcp://admin@dhcp01/").user == "admin"
 
 
-def test_a_failing_ssh_run_raises_with_the_error(monkeypatch, lan):
+def test_a_failing_run_raises_with_the_error(hosts, lan):
+    hosts.result = _Completed(1, "", "Add-DhcpServerv4Reservation : Access is denied")
     server = dhcpctl.connect("windhcp://admin@dhcp01/")
-    monkeypatch.setattr(
-        "dhcpctl.backends._windhcp._subprocess.run",
-        lambda *a, **k: _Completed(
-            1, "", "Add-DhcpServerv4Reservation : Access is denied"
-        ),
-    )
-    with pytest.raises(dhcpctl.ServerError, match="Access is denied"):
+    with pytest.raises(dhcpctl.ServerError, match="failed \\(1\\).*Access is denied"):
         server.add(lan())
+
+
+@pytest.mark.parametrize(
+    "error, message",
+    [
+        (ConnectionRefusedError("refused"), "cannot reach.*refused"),
+        (PermissionError("denied"), "cannot reach.*denied"),
+        (subprocess.TimeoutExpired("x", 120), "did not finish in 120 seconds"),
+    ],
+)
+def test_a_transport_failure_is_a_server_error(hosts, lan, error, message):
+    hosts.error = error
+    server = dhcpctl.connect("windhcp://admin@dhcp01/")
+    with pytest.raises(dhcpctl.ServerError, match=message):
+        server.add(lan())
+
+
+def test_the_timeout_setting_bounds_a_script(hosts, lan):
+    server = dhcpctl.connect("windhcp://admin@dhcp01/?timeout=30")
+    server.add(lan())
+    assert hosts[0][0].timeout.total == 30
 
 
 # -- transport=winrm --------------------------------------------------------
 
 
-@pytest.fixture
-def winrm(monkeypatch):
-    """A fake `winrm` module recording each session and script."""
-    module = types.ModuleType("winrm")
-    module.sessions = []
-    module.result = types.SimpleNamespace(
-        status_code=0, std_out=b'{"ok": true}', std_err=b""
-    )
+def test_winrm_runs_the_script_with_the_password_secret(hosts, lan):
+    import hostctl
 
-    class Session:
-        def __init__(self, endpoint, auth=None, transport=None):
-            self.endpoint = endpoint
-            self.auth = auth
-            self.transport = transport
-            self.scripts = []
-            module.sessions.append(self)
-
-        def run_ps(self, script):
-            self.scripts.append(script)
-            return module.result
-
-    module.Session = Session
-    monkeypatch.setitem(sys.modules, "winrm", module)
-    return module
-
-
-def test_winrm_runs_the_script_with_the_password_secret(winrm, lan):
     server = dhcpctl.connect(
         "windhcp://admin@dhcp01/?transport=winrm", secrets={"password": "pw"}
     )
-    assert server.port == 5985
     server.add(lan())
-    session = winrm.sessions[0]
-    assert session.endpoint == "http://dhcp01:5985/wsman"
-    assert session.auth == ("admin", "pw")
-    assert session.transport == "ntlm"
-    assert "Add-DhcpServerv4Reservation" in session.scripts[0]
+    ((config, script),) = hosts
+    assert isinstance(config, hostctl.WinRMConfig)
+    assert (config.host, config.username, config.auth) == ("dhcp01", "admin", "ntlm")
+    assert config.password == "pw" and not config.tls
+    assert "Add-DhcpServerv4Reservation" in script
 
 
-def test_winrm_over_tls_with_another_auth(winrm, lan):
+def test_winrm_over_tls_with_another_auth(hosts, lan):
     server = dhcpctl.connect(
         "windhcp://admin@dhcp01/?transport=winrm&ssl=true&port=5986&auth=kerberos"
     )
     server.add(lan())
-    session = winrm.sessions[0]
-    assert session.endpoint == "https://dhcp01:5986/wsman"
-    assert session.auth == ("admin", "")
-    assert session.transport == "kerberos"
+    config = hosts[0][0]
+    assert (config.port, config.tls, config.auth) == (5986, True, "kerberos")
 
 
-def test_a_failing_winrm_run_raises_with_the_error(winrm, lan):
-    winrm.result = types.SimpleNamespace(
-        status_code=1, std_out=b"", std_err=b"Access is denied"
-    )
+def test_a_missing_transport_extra_names_dhcpctls(hosts, lan):
+    from hostctl import MissingExtraError
+
+    hosts.error = MissingExtraError("winrm", "WinRM command execution")
     server = dhcpctl.connect("windhcp://admin@dhcp01/?transport=winrm")
-    with pytest.raises(
-        dhcpctl.ServerError, match="over WinRM failed.*Access is denied"
-    ):
-        server.add(lan())
-
-
-def test_winrm_without_the_extra_names_it(monkeypatch, lan):
-    server = dhcpctl.connect("windhcp://admin@dhcp01/?transport=winrm")
-    monkeypatch.setitem(sys.modules, "winrm", None)
-    with pytest.raises(dhcpctl.BackendUnavailableError, match=r"dhcpctl\[winrm\]"):
+    with pytest.raises(dhcpctl.BackendUnavailableError, match=r"pydhcpctl\[winrm\]"):
         server.add(lan())
 
 
@@ -315,6 +317,10 @@ def test_netsh_adds_the_reservation_then_its_options(stub, lan, owner):
         lan(options={"bootfile-name": "pxelinux.0", "ip-address-lease-time": 600})
     )
     commands = _commands(ran[0])
+    # Re-arming replaces the client's reservation: deleting one that is not
+    # there is not an error.
+    assert commands[0][4:] == ["delete", "reservedip", "10.0.0.10", "aabbccddeeff"]
+    commands = commands[1:]
     # The reservation first -- an option on a reservation that does not exist
     # yet is an error, so order is part of the contract.
     assert commands[0] == [
@@ -437,7 +443,7 @@ def test_a_hostile_value_stays_inside_the_json_payload(stub, lan):
     server.add(lan(name=hostile))
     script = ran[0]
     # It survives as data, exactly as given, and never as script text.
-    assert _commands(script)[0][-3] == hostile
+    assert _commands(script)[1][-3] == hostile
     assert "Remove-Item C:\\ -Recurse #'" not in script.split("ConvertFrom-Json")[0]
 
 
@@ -590,7 +596,7 @@ def test_an_empty_host_means_the_shell_is_here(on_windows):
     server = dhcpctl.connect("windhcp:///?server=dhcp01")
     assert server.transport == "local"
     assert server.server == "dhcp01"
-    assert server.port == 0
+    assert server.port is None
 
 
 def test_a_named_host_still_uses_a_transport():
@@ -599,39 +605,16 @@ def test_a_named_host_still_uses_a_transport():
     assert dhcpctl.connect("windhcp://dhcp01/").transport == "ssh"
 
 
-def test_local_runs_the_same_script_the_other_transports_send(
-    monkeypatch, on_windows, lan
-):
-    calls = []
+def test_local_runs_the_same_script_the_other_transports_send(hosts, on_windows, lan):
+    import hostctl
 
-    def fake_run(argv, **kwargs):
-        calls.append((argv, kwargs.get("input")))
-        return _Completed()
-
-    monkeypatch.setattr(subprocess, "run", fake_run)
     r = lan()
-
-    local = dhcpctl.connect("windhcp:///?server=dhcp01")
-    local.add(r)
-    argv, script = calls[-1]
-    assert argv == list(POWERSHELL_ARGV)
-    assert "-NonInteractive" in argv
-
-    # Byte-identical to what ssh would have piped in.
-    over_ssh = dhcpctl.connect("windhcp://host/?server=dhcp01")
-    sent = []
-    over_ssh.run = lambda payload, body: sent.append(over_ssh.script_for(payload, body))
-    over_ssh.add(r)
-    assert script in sent
-
-
-def test_a_failing_local_powershell_is_reported(monkeypatch, on_windows, lan):
-    monkeypatch.setattr(
-        subprocess, "run", lambda *a, **k: _Completed(3, "", "it did not work")
-    )
-    server = dhcpctl.connect("windhcp:///?server=dhcp01")
-    with pytest.raises(dhcpctl.ServerError, match="local PowerShell failed"):
-        server.add(lan())
+    dhcpctl.connect("windhcp:///?server=dhcp01").add(r)
+    dhcpctl.connect("windhcp://host/?server=dhcp01").add(r)
+    (local, here), (ssh, there) = hosts
+    assert isinstance(local, hostctl.LocalConfig)
+    assert isinstance(ssh, hostctl.SSHConfig)
+    assert here == there
 
 
 def test_local_is_refused_where_there_is_no_powershell(monkeypatch):
@@ -695,14 +678,9 @@ def test_a_netsh_command_given_as_one_string_is_refused(stub, lan):
 
 
 @pytest.mark.parametrize("stdout", ["", "{}", "item 1\n"])
-def test_a_script_that_does_not_reach_its_end_is_a_server_error(
-    monkeypatch, lan, stdout
-):
+def test_a_script_that_does_not_reach_its_end_is_a_server_error(hosts, lan, stdout):
     server = dhcpctl.connect("windhcp://dhcp01/")
-    monkeypatch.setattr(
-        "dhcpctl.backends._windhcp._subprocess.run",
-        lambda argv, **kwargs: _Completed(stdout=stdout),
-    )
+    hosts.result = _Completed(stdout=stdout)
     with pytest.raises(dhcpctl.ServerError, match="without finishing"):
         server.add(lan())
 
@@ -759,3 +737,10 @@ def test_what_a_windows_reservation_cannot_carry_is_warned_about(reservation, ca
     with caplog.at_level("WARNING", logger="dhcpctl"):
         _sent_netsh("windhcp://dhcp01/", r)
     assert "option 119" in caplog.text and "next-server 10.0.0.2" in caplog.text
+
+
+def test_a_flag_is_the_byte_windows_stores():
+    from dhcpctl.backends._windhcp import _values
+
+    assert _values(True) == [1] and _values(False) == [0]
+    assert _values(["10.0.0.1", "10.0.0.2"]) == ["10.0.0.1", "10.0.0.2"]

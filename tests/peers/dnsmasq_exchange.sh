@@ -1,12 +1,16 @@
 #!/bin/sh
 # One DHCP exchange between a real dnsmasq and a real client, in network
 # namespaces of the caller's own: run as `unshare -rn sh dnsmasq_exchange.sh
-# HOSTS OPTS MAC OUT`. HOSTS and OPTS are what dnsmasq reads as
+# HOSTS OPTS MAC OUT [OPTION...]`. HOSTS and OPTS are what dnsmasq reads as
 # --dhcp-hostsfile and --dhcp-optsfile (a file or a directory). OUT receives
 # what the client was given (udhcpc's variables, one per line), or NO-LEASE,
-# then dnsmasq's own log after a `--- dnsmasq` line.
+# then dnsmasq's own log after a `--- dnsmasq` line. Each OPTION is a code the
+# client also asks for, as dnsmasq sends only what is asked for.
 set -eu
 HOSTS=$1 OPTS=$2 MAC=$3 OUT=$4
+shift 4
+ASK=
+for code in "$@"; do ASK="$ASK -O $code"; done
 WORK=$(mktemp -d)
 trap 'kill "$SERVER" "$CLIENT" 2>/dev/null || true; rm -rf "$WORK"' EXIT
 SERVER= CLIENT=
@@ -34,13 +38,13 @@ sleep 0.5
 cat >"$WORK/script" <<'EOF'
 #!/bin/sh
 [ "$1" = bound ] || exit 0
-env | grep -E '^(ip|siaddr|sname|boot_file|bootfile|tftp|router|dns|domain|hostname|opt[0-9]+)=' | sort >"$OUT"
+env | grep -E '^(ip|siaddr|sname|boot_file|bootfile|tftp|router|dns|domain|hostname|timezone|mtu|ipttl|search|ntpsrv|opt[0-9]+)=' | sort >"$OUT"
 EOF
 chmod +x "$WORK/script"
 echo NO-LEASE >"$OUT"
 export OUT
 nsenter -t "$CLIENT" -n sh -c 'ip link set lo up; ip link set cli up;
-  udhcpc -i cli -n -q -f -t 3 -T 1 -s "$0" >/dev/null 2>&1' "$WORK/script" || true
+  udhcpc -i cli -n -q -f -t 3 -T 1 -s "$0" $1 >/dev/null 2>&1' "$WORK/script" "$ASK" || true
 
 echo "--- dnsmasq" >>"$OUT"
 cat "$WORK/dnsmasq.log" >>"$OUT"

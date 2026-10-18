@@ -75,14 +75,17 @@ SETTINGS_ONLY = {
             "pidfile": "/run/dnsmasq.pid",
         },
     ),
-    "kea": ("kea://kea01/?service=dhcp4", {"service": "dhcp4"}),
+    "kea": (
+        "kea://kea01/?service=dhcp4&target=memory",
+        {"service": "dhcp4", "target": "memory"},
+    ),
     "dhcpd": (
         "dhcpd://dhcp01/?keyname=omapi_key&keyfile=/etc/omapi.key&conditions=group",
         {"keyname": "omapi_key", "keyfile": "/etc/omapi.key", "conditions": "group"},
     ),
     "windhcp": (
         "windhcp://admin@dhcp01/?transport=winrm&method=netsh&server=dhcp02"
-        "&auth=kerberos&port=5986&ssl=true&conditions=shared",
+        "&auth=kerberos&port=5986&ssl=true&conditions=shared&timeout=30",
         {
             "transport": "winrm",
             "method": "netsh",
@@ -91,6 +94,7 @@ SETTINGS_ONLY = {
             "port": "5986",
             "ssl": "true",
             "conditions": "shared",
+            "timeout": "30",
         },
     ),
 }

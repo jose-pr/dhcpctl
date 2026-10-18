@@ -9,7 +9,6 @@ __all__ = [
     "BackendUnavailableError",
     "MissingMACError",
     "ServerError",
-    "ReservationExistsError",
     "ConditionUnsupportedError",
     "ConditionMissingError",
 ]
@@ -37,10 +36,6 @@ class MissingMACError(DHCPCtlError, LookupError):
 
 class ServerError(DHCPCtlError):
     """The server, or the program that talks to it, refused or failed."""
-
-
-class ReservationExistsError(ServerError):
-    """The server already holds a reservation for this client."""
 
 
 class ConditionUnsupportedError(DHCPCtlError):

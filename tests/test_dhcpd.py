@@ -179,9 +179,12 @@ def test_an_opaque_option_is_written_as_colon_separated_octets():
 
 
 def test_a_boolean_option_is_written_as_dhcpd_reads_it():
-    # dhcpd has no name here for it, so it gets the octets.
     assert render_statements(PYDHCP_CODES.lease({"ip-forwarding": True})) == (
-        "option unknown-19 01;"
+        "option ip-forwarding true;"
+    )
+    # dhcpd defines auto-config as a number.
+    assert render_statements(PYDHCP_CODES.lease({"option-116": True})) == (
+        "option auto-config 1;"
     )
 
 
@@ -342,5 +345,19 @@ def test_dhcpd_keep_uses_the_remove_phase_extras(omapi, reservation):
 def test_a_text_option_pydhcp_knows_is_quoted():
     # root-path is a String codec, so dhcpd gets a string literal.
     assert render_statements(PYDHCP_CODES.lease({"root-path": "/srv/nfs root"})) == (
-        'option unknown-17 "/srv/nfs root";'
+        'option root-path "/srv/nfs root";'
     )
+
+
+def test_a_negative_number_and_a_domain_name_are_written_bare():
+    statements = render_statements(
+        PYDHCP_CODES.lease({"time-offset": -3600, "option-213": "example.com"})
+    )
+    assert (
+        statements == "option time-offset -3600; option v4-access-domain example.com;"
+    )
+
+
+def test_octets_for_an_option_dhcpd_structures_are_refused():
+    with pytest.raises(dhcpctl.ConfigError, match="option 85 .*extras"):
+        render_statements(PYDHCP_CODES.lease({"option-85": "0a0b"}))

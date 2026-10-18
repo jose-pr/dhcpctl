@@ -31,14 +31,39 @@ def _uri(hosts, opts, extra=""):
     )
 
 
+class _Recorded(list):
+    """Each reload's argv, prefixed with `ssh <user@host>` when it ran remotely."""
+
+    error = None
+
+
 @pytest.fixture
 def recorded(monkeypatch):
-    """The reload commands run, instead of running them."""
-    argvs = []
-    monkeypatch.setattr(
-        "dhcpctl.backends._dnsmasq._subprocess.run",
-        lambda argv, **kw: argvs.append(argv),
-    )
+    """The reload commands hostctl would run, instead of running them."""
+    import hostctl
+
+    argvs = _Recorded()
+
+    class _Host:
+        def __init__(self, config):
+            self.config = config
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def run(self, command, **kwargs):
+            argv = [command.program, *command.args]
+            if isinstance(self.config, hostctl.SSHConfig):
+                user = f"{self.config.username}@" if self.config.username else ""
+                argv = ["ssh", f"{user}{self.config.host}", *argv]
+            argvs.append(argv)
+            if argvs.error is not None:
+                raise argvs.error
+
+    monkeypatch.setattr("dhcpctl.backends._dnsmasq._open_host", _Host)
     return argvs
 
 
@@ -376,15 +401,21 @@ def test_a_local_reload_runs_directly(tmp_path, reservation, recorded):
     assert recorded == [["systemctl", "reload", "dnsmasq"]]
 
 
-def test_a_failing_reload_is_a_server_error(tmp_path, reservation, monkeypatch):
+@pytest.mark.parametrize(
+    "error, message",
+    [
+        (subprocess.CalledProcessError(3, "x"), r"failed \(3\)"),
+        (subprocess.TimeoutExpired("x", 60), "did not finish in 60 seconds"),
+        (FileNotFoundError("no such program"), "cannot run reload command"),
+    ],
+)
+def test_a_failing_reload_is_a_server_error(
+    tmp_path, reservation, recorded, error, message
+):
     hosts, opts = _dirs(tmp_path)
-
-    def fail(argv, **kw):
-        raise subprocess.CalledProcessError(3, argv)
-
-    monkeypatch.setattr("dhcpctl.backends._dnsmasq._subprocess.run", fail)
+    recorded.error = error
     server = dhcpctl.connect(_uri(hosts, opts, "&reload=systemctl+reload+dnsmasq"))
-    with pytest.raises(dhcpctl.ServerError, match=r"failed \(3\)"):
+    with pytest.raises(dhcpctl.ServerError, match=message):
         server.add(reservation())
 
 
@@ -456,3 +487,58 @@ def test_option_67_is_a_dhcp_option_not_dhcp_boot(tmp_path, reservation):
         "tag:web01,option:tftp-server,tftp01",
         "tag:web01,67,a.efi",
     ]
+
+
+@pytest.mark.parametrize(
+    "options, line",
+    [
+        ({"option-224": "0a0b"}, "tag:web01,224,0a:0b"),
+        ({"option-224": "0a"}, "tag:web01,224,10"),  # alone, `0a` is text
+        ({"ip-forwarding": True}, "tag:web01,19,1"),
+        ({"time-offset": -3600}, "tag:web01,2,ff:ff:f1:f0"),
+        ({"mtu-plateau": [576, 1500]}, "tag:web01,25,02:40:05:dc"),
+        ({"router": ["10.0.0.1", "10.0.0.2"]}, "tag:web01,3,10.0.0.1,10.0.0.2"),
+        ({"domain-name": "example.com"}, "tag:web01,15,example.com"),
+    ],
+)
+def test_each_value_is_written_as_dnsmasq_reads_it(options, line):
+    from dhcpctl.backends._dnsmasq import _option_lines
+
+    assert _option_lines("web01", dhcpctl.PYDHCP_CODES.lease(options)) == [line]
+
+
+_WRITER = """
+import sys
+import dhcpctl
+from netimps import MACAddress
+
+server = dhcpctl.connect(sys.argv[1])
+for n in range(int(sys.argv[3])):
+    name = f"{sys.argv[2]}{n}"
+    mac = MACAddress(f"aa:bb:cc:{sys.argv[2] == 'a' and 1 or 2:02x}:00:{n:02x}")
+    server.add(dhcpctl.Reservation(dhcpctl.Target(name, mac=mac)))
+"""
+
+
+def test_two_writers_of_one_hosts_file_keep_each_others_entries(tmp_path):
+    import subprocess
+    import sys
+
+    hosts = tmp_path / "hosts"
+    uri = f"dnsmasq:///?hostsfile={hosts.as_posix()}&reload=true"
+    script = tmp_path / "writer.py"
+    script.write_text(_WRITER, encoding="utf-8")
+    writers = [
+        subprocess.Popen([sys.executable, str(script), uri, prefix, "25"])
+        for prefix in ("a", "b")
+    ]
+    assert [writer.wait(timeout=120) for writer in writers] == [0, 0]
+    text = hosts.read_text(encoding="utf-8")
+    lines = set(text.splitlines())
+    missing = [f"{p}{n}" for p in "ab" for n in range(25)]
+    missing = [
+        name
+        for name in missing
+        if not any(line.endswith(f",set:{name}") for line in lines)
+    ]
+    assert missing == []

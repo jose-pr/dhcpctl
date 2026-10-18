@@ -1,10 +1,11 @@
-"""Windows DHCP Server backend: its cmdlets or netsh, over ssh or WinRM.
+"""Windows DHCP Server backend: its cmdlets or netsh, locally, over ssh or WinRM.
 
 Windows DHCP has no line protocol to speak, so this backend drives the server's own
 tooling where the operator already has access. Two independent choices:
 
-- **`transport=`** -- how we get a shell: `local` (this machine, no dependency),
-  `ssh` (the system client) or `winrm`.
+- **`transport=`** -- how we get a shell, through hostctl: `local` (this
+  machine), `ssh` or `winrm`. hostctl delivers the PowerShell script whole and
+  reports its status, on every transport.
 - **`method=`** -- what we run there: `powershell` (the `DhcpServer` module's
   cmdlets, the default) or `netsh` (`netsh dhcp server ...`), for a host where
   the DHCP Server PowerShell module is not installed -- a Server Core box
@@ -54,7 +55,6 @@ costs nothing and removes the whole command-line quoting question.
 
 from __future__ import annotations
 
-import base64 as _base64
 import json as _json
 import logging
 import os as _os
@@ -169,25 +169,6 @@ ConvertTo-Json @{{ ok = $true }}
 """
 
 
-#: Reads the script whole from standard input and runs it as one scriptblock.
-#: `-Command -` reads standard input a line at a time: it runs only the first
-#: line of a multi-line block and exits 0 whatever fails. An error is written
-#: as plain text, where Windows PowerShell would wrap it in CLIXML.
-_BOOTSTRAP = (
-    "$ProgressPreference = 'SilentlyContinue'; $s = [Console]::In.ReadToEnd(); "
-    "try { & ([scriptblock]::Create($s)) } "
-    "catch { [Console]::Error.WriteLine($_.Exception.Message); exit 1 }"
-)
-
-#: How PowerShell is started for a script on standard input, locally or over ssh.
-POWERSHELL_ARGV = (
-    "powershell",
-    "-NoProfile",
-    "-NonInteractive",
-    "-EncodedCommand",
-    _base64.b64encode(_BOOTSTRAP.encode("utf-16-le")).decode("ascii"),
-)
-
 #: What `_SCRIPT` prints last; output without it means the script did not finish.
 _FINISHED = _re.compile(r'"ok"\s*:\s*true')
 
@@ -270,7 +251,16 @@ class WinDHCPBackend(DHCPServer):
     """
 
     SETTINGS = frozenset(
-        {"transport", "method", "server", "auth", "port", "ssl", "conditions"}
+        {
+            "transport",
+            "method",
+            "server",
+            "auth",
+            "port",
+            "ssl",
+            "conditions",
+            "timeout",
+        }
     )
 
     def __init__(
@@ -313,10 +303,14 @@ class WinDHCPBackend(DHCPServer):
             )
         self.server = self.settings.get("server") or ""
         self.auth = self.settings.get("auth", "ntlm")
-        self.port = int(
-            self.settings.get("port")
-            or {"ssh": 22, "winrm": 5985, "local": 0}[self.transport]
-        )
+        try:
+            self.port = (
+                int(self.settings["port"]) if self.settings.get("port") else None
+            )
+            #: Seconds one script may run, `timeout=` (default 120).
+            self.timeout = float(self.settings.get("timeout") or 120)
+        except ValueError as exc:
+            raise ConfigError(f"windhcp: port and timeout are numbers: {exc}") from exc
         self.ssl = str(self.settings.get("ssl", "")).lower() in ("1", "true", "yes")
 
     @property
@@ -360,6 +354,14 @@ class WinDHCPBackend(DHCPServer):
         body = [
             "$common = @{}",
             "if ($p.ComputerName) { $common['ComputerName'] = $p.ComputerName }",
+            # Re-arming replaces the client's reservation, and its options with it.
+            "$existing = Get-DhcpServerv4Reservation -ScopeId $p.ScopeId @common"
+            " -ErrorAction SilentlyContinue |"
+            " Where-Object { $_.ClientId -eq $p.ClientId }",
+            "if ($existing) {",
+            "  Remove-DhcpServerv4Reservation -ScopeId $p.ScopeId"
+            " -ClientId $p.ClientId @common",
+            "}",
             "Add-DhcpServerv4Reservation -ScopeId $p.ScopeId -IPAddress $p.IPAddress"
             " -ClientId $p.ClientId -Name $p.Name @common",
             "foreach ($o in $p.Options) {",
@@ -693,6 +695,17 @@ class WinDHCPBackend(DHCPServer):
         base = self._netsh_scope(scope)
         commands = [
             {
+                # Re-arming replaces the client's reservation; none is fine.
+                "Args": base
+                + [
+                    "delete",
+                    "reservedip",
+                    _address(reservation),
+                    _netsh_client_id(target),
+                ],
+                "Ignore": True,
+            },
+            {
                 # `add reservedip <ip> <mac> [name] [comment] [BOTH|DHCP|BOOTP]`.
                 # BOTH matches the cmdlets' default, so switching method does not
                 # change which protocols the reservation answers.
@@ -707,7 +720,7 @@ class WinDHCPBackend(DHCPServer):
                     "BOTH",
                 ],
                 "Ignore": False,
-            }
+            },
         ]
         overridden = self._overridden_ids(reservation.conditions.values())
         codes = {int(code): code for code, _ in plain_items(options)}
@@ -826,6 +839,15 @@ class WinDHCPBackend(DHCPServer):
 
     # -- running PowerShell ------------------------------------------------
 
+    def _recording(self, sent: List[str]) -> Any:
+        """Each script the shell would be given, payload included."""
+
+        def run(payload: Dict[str, Any], body: List[str]) -> str:
+            sent.append(self.script_for(payload, body))
+            return _FINISHED
+
+        return self._replaced(run=run)
+
     def script_for(self, payload: Dict[str, Any], body: List[str]) -> str:
         """The script we will run: parameters as data, never as source."""
         # json.dumps escapes every non-ASCII character, typographic quotes
@@ -833,77 +855,78 @@ class WinDHCPBackend(DHCPServer):
         encoded = _json.dumps(payload).replace("'", "''")
         return _SCRIPT.format(payload=encoded, body="\n".join(body))
 
+    def host_config(self) -> Any:
+        """The hostctl config of the shell this server's scripts run in."""
+        import hostctl
+        from hostctl.shell import POWERSHELL
+
+        if self.transport == "local":
+            return hostctl.LocalConfig(timeout=self.timeout)
+        password = self.secret("password") or None
+        if self.transport == "ssh":
+            # A Windows OpenSSH server hands the command to cmd.exe, which a
+            # Windows path flavour tells hostctl.
+            return hostctl.SSHConfig(
+                self.hostname,
+                port=self.port or 22,
+                username=self.user or None,
+                password=password,
+                shell=POWERSHELL,
+                pathname="windows",
+                timeout=self.timeout,
+            )
+        return hostctl.WinRMConfig(
+            self.hostname,
+            username=self.user,
+            password=password,
+            auth=self.auth,
+            port=self.port,
+            tls=self.ssl,
+            timeout=self.timeout,
+        )
+
     def run(self, payload: Dict[str, Any], body: List[str]) -> str:
         """Run `body` on the transport, with `payload` as `$p`; its output.
 
-        :raises ServerError: the script failed, or ended without reaching its
-            last line.
+        :raises ServerError: the script failed, ended without reaching its
+            last line, or the shell could not be reached.
+        :raises BackendUnavailableError: the transport's extra is missing.
         """
         script = self.script_for(payload, body)
-        if self.transport == "winrm":
-            output = self._run_winrm(script)
-        elif self.transport == "local":
-            output = self._run_local(script)
-        else:
-            output = self._run_ssh(script)
-        if not _FINISHED.search(output or ""):
+        LOGGER.debug("windhcp %s: %s", self.transport, self)
+        try:
+            with _open_host(self.host_config()) as host:
+                done = host.run(script, check=False, text=True)
+        except ImportError as exc:
+            extra = getattr(exc, "extra", None) or self.transport
+            raise BackendUnavailableError(
+                f"the Windows DHCP backend over {self.transport} requires the "
+                f"{extra!r} extra: pip install pydhcpctl[{extra}]"
+            ) from exc
+        except _subprocess.TimeoutExpired as exc:
+            raise ServerError(
+                f"windhcp: the PowerShell script on {self} did not finish in "
+                f"{self.timeout:g} seconds"
+            ) from exc
+        except OSError as exc:
+            raise ServerError(f"windhcp: cannot reach {self}: {exc}") from exc
+        output = done.stdout or ""
+        if done.returncode != 0:
+            raise ServerError(
+                f"windhcp: PowerShell on {self} failed ({done.returncode}): "
+                f"{(done.stderr or output).strip()}"
+            )
+        if not _FINISHED.search(output):
             raise ServerError(
                 f"windhcp: the {self.transport} PowerShell script ended without "
-                f"finishing: {(output or '').strip() or 'no output'}"
+                f"finishing: {output.strip() or 'no output'}"
             )
         return output
 
-    def _run_local(self, script: str) -> str:
-        """Feed the script to PowerShell on this machine, as ssh does remotely."""
-        argv = list(POWERSHELL_ARGV)
-        LOGGER.debug("windhcp local: %s", argv)
-        completed = _subprocess.run(
-            argv, input=script, capture_output=True, text=True, timeout=120
-        )
-        if completed.returncode != 0:
-            raise ServerError(
-                f"windhcp: local PowerShell failed ({completed.returncode}): "
-                f"{(completed.stderr or completed.stdout).strip()}"
-            )
-        return completed.stdout
 
-    def _run_ssh(self, script: str) -> str:
-        """Feed the script to PowerShell over the system ssh client."""
-        destination = f"{self.user}@{self.hostname}" if self.user else self.hostname
-        argv = ["ssh", "-p", str(self.port), destination, *POWERSHELL_ARGV]
-        LOGGER.debug("windhcp ssh: %s", argv)
-        completed = _subprocess.run(
-            argv, input=script, capture_output=True, text=True, timeout=120
-        )
-        if completed.returncode != 0:
-            raise ServerError(
-                f"windhcp: PowerShell over ssh failed ({completed.returncode}): "
-                f"{(completed.stderr or completed.stdout).strip()}"
-            )
-        return completed.stdout
-
-    def _run_winrm(self, script: str) -> str:
-        try:
-            import winrm
-        except ImportError as exc:  # pragma: no cover - only without the extra
-            raise BackendUnavailableError(
-                "the Windows DHCP backend over WinRM requires the 'winrm' "
-                "extra: pip install pydhcpctl[winrm]"
-            ) from exc
-
-        scheme = "https" if self.ssl else "http"
-        endpoint = f"{scheme}://{self.hostname}:{self.port}/wsman"
-        password = self.secret("password") or ""
-        session = winrm.Session(
-            endpoint, auth=(self.user, password), transport=self.auth
-        )
-        result = session.run_ps(script)
-        if result.status_code != 0:
-            raise ServerError(
-                f"windhcp: PowerShell over WinRM failed ({result.status_code}): "
-                f"{_text(result.std_err) or _text(result.std_out)}"
-            )
-        return _text(result.std_out)
+def _open_host(config: Any) -> Any:
+    """An open hostctl host for `config`, closed by `with`."""
+    return config.open()
 
 
 #: `match` key -> the `-Type` of the Windows DHCP class that carries it.
@@ -969,7 +992,7 @@ def _script_lines(extras: List[Any]) -> List[str]:
             lines.append(f"$out = & netsh {rendered} 2>&1 | Out-String")
             lines.append(
                 'if ($LASTEXITCODE -ne 0) { throw "netsh failed '
-                f'($LASTEXITCODE): $out" }}'
+                '($LASTEXITCODE): $out" }'
             )
     lines.extend(plain)
     return lines
@@ -986,10 +1009,6 @@ def _ps_quote(value: Any) -> str:
     for quote in _PS_QUOTES:
         text = text.replace(quote, quote * 2)
     return "'" + text + "'"
-
-
-def _text(value: Any) -> str:
-    return value.decode(errors="replace") if isinstance(value, bytes) else str(value)
 
 
 def _scope(reservation: Reservation) -> str:
@@ -1026,9 +1045,14 @@ def _netsh_client_id(target: Target) -> str:
 
 
 def _values(value: Any) -> List[Any]:
-    """A value as the list netsh takes, one argument per entry."""
+    """A value as the list netsh takes, one argument per entry.
+
+    A flag is the BYTE Windows stores for it, 1 or 0: `True` is no byte.
+    """
     if isinstance(value, (list, tuple)):
         return list(value)
+    if isinstance(value, bool):
+        return [int(value)]
     return [value]
 
 

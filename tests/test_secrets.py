@@ -101,28 +101,30 @@ def test_kea_takes_its_account_from_the_caller_too():
 
 @pytest.fixture
 def winrm(monkeypatch):
-    module = types.ModuleType("winrm")
-    module.sessions = []
+    """The hostctl configs the Windows backend opens, instead of opening them."""
+    configs = []
 
-    class Session:
-        def __init__(self, endpoint, auth=None, transport=None):
-            self.auth = auth
-            module.sessions.append(self)
+    class _Host:
+        def __init__(self, config):
+            configs.append(config)
 
-        def run_ps(self, script):
-            return types.SimpleNamespace(
-                status_code=0, std_out=b'{"ok": true}', std_err=b""
-            )
+        def __enter__(self):
+            return self
 
-    module.Session = Session
-    monkeypatch.setitem(sys.modules, "winrm", module)
-    return module
+        def __exit__(self, *exc):
+            return False
+
+        def run(self, script, **kwargs):
+            return types.SimpleNamespace(returncode=0, stdout='{"ok": true}', stderr="")
+
+    monkeypatch.setattr("dhcpctl.backends._windhcp._open_host", _Host)
+    return configs
 
 
 def test_windhcp_takes_the_winrm_password_from_the_uri(winrm, reservation):
     server = dhcpctl.connect("windhcp://admin:s3cret@dhcp01/?transport=winrm")
     server.remove(reservation())
-    assert winrm.sessions[0].auth == ("admin", "s3cret")
+    assert (winrm[0].username, winrm[0].password) == ("admin", "s3cret")
     assert "s3cret" not in repr(server)
 
 
@@ -132,7 +134,7 @@ def test_a_callers_winrm_password_overrides_the_uris(winrm, reservation):
         secrets={"password": "vault"},
     )
     server.remove(reservation())
-    assert winrm.sessions[0].auth == ("admin", "vault")
+    assert (winrm[0].username, winrm[0].password) == ("admin", "vault")
 
 
 @pytest.fixture

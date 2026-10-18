@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import contextlib as _contextlib
+
 from typing import (
     Any,
     Callable,
@@ -196,6 +198,49 @@ class DHCPServer:
         for condition in reservation.conditions.values():
             self.remove_condition_member(reservation, condition)
         return self.keep(reservation)
+
+    #: What `render` can show: the operations that send something.
+    RENDERED = ("add", "remove", "keep", "complete")
+
+    def render(self, reservation: Reservation, action: str = "add") -> str:
+        """What `action` would send this server for `reservation`, contacting
+        nothing: the backend's own text, one step after another.
+
+        `action` is `add`, `remove`, `keep` or `complete`. A step that needs an
+        answer from the server is given the answer "there is nothing yet", so
+        the text is what a server holding nothing for this client would get.
+
+        :raises NotImplementedError: the backend cannot record what it sends.
+        :raises ValueError: an unknown `action`.
+        """
+        if action not in self.RENDERED:
+            raise ValueError(f"action must be one of {self.RENDERED}, not {action!r}")
+        sent: List[str] = []
+        with self._recording(sent):
+            getattr(self, action)(reservation)
+        return "\n".join(sent) + ("\n" if sent else "")
+
+    def _recording(self, sent: List[str]) -> Any:
+        """A context in which what this backend sends is appended to `sent`
+        instead; a backend that can render overrides it."""
+        raise NotImplementedError(
+            f"{type(self).__name__} cannot render what it would send"
+        )
+
+    @_contextlib.contextmanager
+    def _replaced(self, **seams: Any) -> Any:
+        """Put `seams` on this instance for the duration, then restore it."""
+        missing = object()
+        saved = {name: vars(self).get(name, missing) for name in seams}
+        vars(self).update(seams)
+        try:
+            yield
+        finally:
+            for name, value in saved.items():
+                if value is missing:
+                    vars(self).pop(name, None)
+                else:
+                    vars(self)[name] = value
 
     def extras(self, reservation: Reservation, phase: str = "add") -> List[Any]:
         """Backend-native fragments to apply with the reservation, verbatim.

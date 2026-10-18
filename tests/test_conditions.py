@@ -435,10 +435,15 @@ def _dhcpd(uri="dhcpd://dhcp01/", **kwargs):
     return server, calls
 
 
+def _created(calls):
+    """The keyword arguments of the `create_host` call."""
+    return next(call[2] for call in calls if call[0] == "create_host")
+
+
 def test_dhcpd_inlines_the_conditional_by_default(armed):
     server, calls = _dhcpd()
     server.add(armed())
-    statements = calls[0][2]["statements"]
+    statements = _created(calls)["statements"]
     assert 'filename "undionly.kpxe";' in statements
     assert 'if exists user-class and option user-class = "iPXE"' in statements
     # The unconditional option comes first, so the conditional overrides it.
@@ -456,7 +461,7 @@ def test_a_condition_next_server_is_a_statement_inside_its_if(armed):
         )
     }
     server.add(armed(conditions=conditions, next_server="10.0.0.2"))
-    statements = calls[0][2]["statements"]
+    statements = _created(calls)["statements"]
     assert statements == (
         'option subnet-mask 255.255.255.0; filename "undionly.kpxe"; '
         "next-server 10.0.0.2; "
@@ -475,17 +480,18 @@ def test_dhcpd_group_mode_creates_the_group_and_attaches_the_host(armed):
     server, calls = _dhcpd("dhcpd://dhcp01/?conditions=group")
     server.add(armed())
     names = [call[0] for call in calls]
-    assert names == ["group_exists", "add_group", "create_host", "close"]
+    # Re-arming replaces a host, so the create follows a delete.
+    assert names == ["group_exists", "add_group", "del_host", "create_host", "close"]
     assert calls[1][1][0] == "ipxe"
     assert "if exists user-class" in calls[1][1][1]
     # The host is created in its group: never a moment without its condition.
-    assert calls[2][2]["group"] == "ipxe"
+    assert _created(calls)["group"] == "ipxe"
     # The host's own boot file applies only where the group's condition does not.
-    assert calls[2][2]["statements"].startswith("option subnet-mask")
+    assert _created(calls)["statements"].startswith("option subnet-mask")
     assert (
         'if (exists user-class and option user-class = "iPXE") { } else '
         '{ filename "undionly.kpxe"; }'
-    ) in calls[2][2]["statements"]
+    ) in _created(calls)["statements"]
 
 
 def test_dhcpd_group_mode_names_one_group_for_several_conditions(armed):
@@ -498,7 +504,7 @@ def test_dhcpd_group_mode_names_one_group_for_several_conditions(armed):
     server.add(armed(conditions=conditions))
     # A host belongs to exactly one group, so one group carries both.
     assert calls[1][0] == "add_group" and calls[1][1][0] == "ipxe-winpe"
-    assert calls[2][2]["group"] == "ipxe-winpe"
+    assert _created(calls)["group"] == "ipxe-winpe"
 
 
 def test_dhcpd_group_mode_uses_a_group_that_is_already_there(armed):
@@ -510,7 +516,7 @@ def test_dhcpd_group_mode_uses_a_group_that_is_already_there(armed):
 
     server.omapi = lambda: _Existing(calls)
     server.add(armed())
-    assert [call[0] for call in calls] == ["create_host", "close"]
+    assert [call[0] for call in calls] == ["del_host", "create_host", "close"]
 
 
 def test_dhcpd_group_mode_arms_nothing_when_the_group_cannot_be_made(armed):
@@ -560,12 +566,12 @@ def test_an_unknown_dhcpd_conditions_mode_is_refused():
         dhcpctl.connect("dhcpd://dhcp01/?conditions=policies")
 
 
-def test_the_dhcpd_recipe_is_a_config_group_that_survives_a_restart(armed, ipxe):
+def test_the_dhcpd_recipe_is_a_config_group(armed, ipxe):
     server, _ = _dhcpd()
     recipe = server.condition_recipe(armed(), ipxe)
     assert recipe.startswith("# dhcpctl:")
     assert 'group "ipxe" {' in recipe
-    assert "survives a restart" in recipe
+    assert "need not be created over OMAPI" in recipe
 
 
 # -- kea: a client class ---------------------------------------------------
@@ -585,25 +591,50 @@ def _kea(class_exists=False, **kwargs):
     return server, sent
 
 
-def test_kea_uses_a_class_that_already_exists(armed):
+CLIENT = "aabbccddeeff"
+
+
+def test_kea_updates_this_clients_class_when_it_exists(armed):
     server, sent = _kea(class_exists=True)
     server.add(armed())
-    assert [cmd for cmd, _ in sent] == ["class-get", "reservation-add"]
+    assert [cmd for cmd, _ in sent] == [
+        "class-get",
+        "class-update",
+        "class-get",
+        "class-update",
+        "reservation-add",
+    ]
 
 
-def test_kea_adds_the_class_when_it_can(armed):
+def test_kea_adds_this_clients_classes_when_it_can(armed):
     server, sent = _kea(class_exists=False)
     server.add(armed())
-    assert [cmd for cmd, _ in sent] == ["class-get", "class-add", "reservation-add"]
-    entry = dict(sent[1][1])["client-classes"][0]
-    assert entry["name"] == "ipxe"
-    assert entry["test"] == "option[77].text == 'iPXE'"
+    assert [cmd for cmd, _ in sent] == [
+        "class-get",
+        "class-add",
+        "class-get",
+        "class-add",
+        "reservation-add",
+    ]
+    condition = dict(sent[1][1])["client-classes"][0]
+    assert condition["name"] == f"ipxe-{CLIENT}"
+    assert condition["test"] == f"pkt4.mac == 0x{CLIENT} and option[77].hex == 'iPXE'"
     # The boot file is the class's header field, as on a reservation.
-    assert entry["boot-file-name"] == "boot.ipxe"
-    assert "option-data" not in entry
+    assert condition["boot-file-name"] == "boot.ipxe"
+    assert "option-data" not in condition
+    # What the condition overrides is served by a class of the client's that
+    # matches when it does not; the rest stays in the reservation.
+    base = dict(sent[3][1])["client-classes"][0]
+    assert base["name"] == f"dhcpctl-{CLIENT}"
+    assert base["test"] == f"pkt4.mac == 0x{CLIENT} and not member('ipxe-{CLIENT}')"
+    assert base["boot-file-name"] == "undionly.kpxe" and "option-data" not in base
+    reservation = dict(sent[4][1])["reservation"]
+    assert "boot-file-name" not in reservation
+    assert "client-classes" not in reservation
+    assert reservation["option-data"] == [{"code": 1, "data": "255.255.255.0"}]
 
 
-def test_a_kea_class_spells_reservation_fields_as_options():
+def test_a_kea_class_spells_reservation_fields_as_options(reservation):
     # A class has no reservation fields: hostname stays option 12 and a
     # numeric option keeps its code. next-server is the class's own field.
     from dhcpctl.backends._kea import _class
@@ -613,9 +644,10 @@ def test_a_kea_class_spells_reservation_fields_as_options():
         {"user-class": "iPXE", "vendor-class": "PXEClient"},
         {"next-server": "10.0.0.2", "hostname": "h", "option-252": "x"},
     )
-    entry = _class(condition)
-    assert (
-        entry["test"] == "option[77].text == 'iPXE' and option[60].text == 'PXEClient'"
+    entry = _class(condition, reservation())
+    assert entry["test"] == (
+        f"pkt4.mac == 0x{CLIENT} and option[77].hex == 'iPXE' and "
+        "option[60].hex == 'PXEClient'"
     )
     assert entry["option-data"] == [
         {"code": 12, "data": "h"},
@@ -624,10 +656,10 @@ def test_a_kea_class_spells_reservation_fields_as_options():
     assert entry["next-server"] == "10.0.0.2"
 
 
-def test_a_kea_class_without_next_server_has_no_such_field():
+def test_a_kea_class_without_next_server_has_no_such_field(reservation):
     from dhcpctl.backends._kea import _class
 
-    entry = _class(Condition("c", {"user-class": "iPXE"}, {"file": "x"}))
+    entry = _class(Condition("c", {"user-class": "iPXE"}, {"file": "x"}), reservation())
     assert "next-server" not in entry
 
 
@@ -644,15 +676,31 @@ def test_a_condition_next_server_reaches_the_kea_class_add(armed):
     entry = dict(sent[1][1])["client-classes"][0]
     assert entry["next-server"] == "10.0.0.3"
     assert entry["boot-file-name"] == "boot.ipxe"
-    # The reservation keeps its own next-server; the class's wins on a match.
-    assert dict(sent[2][1])["reservation"]["next-server"] == "10.0.0.2"
+    # Kea serves a reservation's values over any class's, so the client's
+    # own next-server is its base class's, not the reservation's.
+    assert dict(sent[3][1])["client-classes"][0]["next-server"] == "10.0.0.2"
+    assert "next-server" not in dict(sent[4][1])["reservation"]
 
 
-def test_the_kea_reservation_names_its_classes(armed):
+def test_a_condition_that_overrides_nothing_set_needs_no_base_class(armed):
+    server, sent = _kea(class_exists=False)
+    server.add(armed(options={"subnet-mask": "255.255.255.0"}))
+    assert [cmd for cmd, _ in sent] == ["class-get", "class-add", "reservation-add"]
+
+
+def test_leaving_a_condition_deletes_the_base_class_first(armed):
     server, sent = _kea(class_exists=True)
-    server.add(armed())
-    reservation = dict(sent[-1][1])["reservation"]
-    assert reservation["client-classes"] == ["ipxe"]
+    server.remove_condition_member(armed(), armed().conditions["ipxe"])
+    assert sent == [
+        ("class-del", {"name": f"dhcpctl-{CLIENT}"}),
+        ("class-del", {"name": f"ipxe-{CLIENT}"}),
+    ]
+
+
+def test_removing_a_client_removes_its_classes(armed):
+    server, sent = _kea(class_exists=True)
+    server.remove(armed())
+    assert [cmd for cmd, _ in sent] == ["reservation-del", "class-del", "class-del"]
 
 
 @pytest.mark.parametrize("owner", ["dhcpctl", "netboot"])
@@ -673,8 +721,9 @@ def test_kea_without_the_class_cmds_hook_hands_over_the_json(armed, owner):
     assert "class_cmds" in message
     assert f"so {owner} cannot add one" in message
     assert excinfo.value.recipe.startswith(f"// {owner}:")
-    payload = message[message.index("{") :]
-    assert json.loads(payload)["name"] == "ipxe"
+    first, base = excinfo.value.recipe.split("\n", 1)[1].split("\n}\n")
+    assert json.loads(first + "\n}")["name"] == f"ipxe-{CLIENT}"
+    assert json.loads(base)["name"] == f"{owner}-{CLIENT}"
 
 
 def test_kea_reports_another_class_add_failure(armed):
@@ -686,12 +735,12 @@ def test_kea_reports_another_class_add_failure(armed):
         server.add(armed())
 
 
-def test_a_kea_test_cannot_be_escaped_by_a_match_value():
+def test_a_kea_test_cannot_be_escaped_by_a_match_value(reservation):
     from dhcpctl.backends._kea import _class
 
     condition = Condition("evil", {"user-class": "x' or 'a'=='a"}, {"file": "y"})
     with pytest.raises(dhcpctl.ConfigError, match="quote or newline"):
-        _class(condition)
+        _class(condition, reservation())
 
 
 # -- dnsmasq: refuses ------------------------------------------------------

@@ -5,8 +5,10 @@
 # `omapi_key`. A STEP is `lease` or `lease:<user class>`, a DHCP exchange
 # (the second sending option 77 as that flat string, as iPXE does) whose result
 # goes to OUTDIR/lease<N> as udhcpc's variables, one per line, or NO-LEASE; any
+# STEP `restart` stops dhcpd and starts it again on the same leases file; any
 # other STEP is a shell command run with dhcpd up, and a failing one ends the
-# session with its status. dhcpd's own log is OUTDIR/dhcpd.log.
+# session with its status. dhcpd's own log is OUTDIR/dhcpd.log. The client
+# also asks for each option code in $ASK.
 set -eu
 MAC=$1 KEY=$2 OUT=$3
 shift 3
@@ -33,26 +35,30 @@ default-lease-time 600;
 subnet 10.0.0.0 netmask 255.255.255.0 { range 10.0.0.100 10.0.0.200; }
 EOF
 touch "$WORK/leases"
-dhcpd -f -d -4 -cf "$WORK/dhcpd.conf" -lf "$WORK/leases" -pf "$WORK/pid" srv \
-  >"$OUT/dhcpd.log" 2>&1 &
-SERVER=$!
-for _ in 1 2 3 4 5 6 7 8 9 10; do
-  grep -q "Sending on" "$OUT/dhcpd.log" 2>/dev/null && break
-  sleep 0.3
-done
+start_server() {
+  dhcpd -f -d -4 -cf "$WORK/dhcpd.conf" -lf "$WORK/leases" -pf "$WORK/pid" srv \
+    >>"$OUT/dhcpd.log" 2>&1 &
+  SERVER=$!
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    grep -q "Sending on" "$OUT/dhcpd.log" 2>/dev/null && break
+    sleep 0.3
+  done
+}
+start_server
 
 cat >"$WORK/script" <<'EOF'
 #!/bin/sh
 [ "$1" = bound ] || exit 0
-env | grep -E '^(ip|siaddr|sname|boot_file|bootfile|tftp|router|dns|domain|hostname|opt[0-9]+)=' | sort >"$LEASE"
+env | grep -E '^(ip|siaddr|sname|boot_file|bootfile|tftp|router|dns|domain|hostname|timezone|mtu|ipttl|search|ntpsrv|opt[0-9]+)=' | sort >"$LEASE"
 EOF
 chmod +x "$WORK/script"
 
 exchange() {
   # $1: the user class to send, or nothing.
   CLASS=
+  for code in ${ASK:-}; do CLASS="$CLASS -O $code"; done
   if [ -n "$1" ]; then
-    CLASS="-x 0x4d:$(printf %s "$1" | od -An -tx1 | tr -d ' \n')"
+    CLASS="$CLASS -x 0x4d:$(printf %s "$1" | od -An -tx1 | tr -d ' \n')"
   fi
   nsenter -t "$CLIENT" -n sh -c 'ip link set lo up; ip link set cli up;
     udhcpc -i cli -n -q -R -f -t 3 -T 1 -s "$0" $1 >/dev/null 2>&1' \
@@ -68,6 +74,13 @@ for step in "$@"; do
     export LEASE
     echo NO-LEASE >"$LEASE"
     case "$step" in lease:*) exchange "${step#lease:}" ;; *) exchange "" ;; esac
+    ;;
+  restart)
+    # dhcpd stops and starts again on the same leases file.
+    kill "$SERVER"
+    wait "$SERVER" 2>/dev/null || true
+    : >"$OUT/dhcpd.log"
+    start_server
     ;;
   *)
     sh -c "$step"

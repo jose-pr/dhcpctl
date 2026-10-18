@@ -44,11 +44,13 @@ def peers():
         pytest.skip(reason)
 
 
-def _lease(hosts, opts, tmp_path) -> "dict[str, str]":
-    """What a client with MAC is handed by a dnsmasq reading hosts and opts."""
+def _lease(hosts, opts, tmp_path, ask=()) -> "dict[str, str]":
+    """What a client with MAC, also asking for the `ask` codes, is handed by a
+    dnsmasq reading hosts and opts."""
     out = tmp_path / "out"
     subprocess.run(
-        ["unshare", "-rn", "sh", str(EXCHANGE), str(hosts), str(opts), MAC, str(out)],
+        ["unshare", "-rn", "sh", str(EXCHANGE), str(hosts), str(opts), MAC, str(out)]
+        + [str(code) for code in ask],
         check=True,
         timeout=60,
     )
@@ -189,3 +191,27 @@ def test_a_removed_client_is_not_reserved(server, reservation, tmp_path):
     # A client with no reservation is offered an address from the range.
     assert lease.get("ip") != "10.0.0.10"
     assert "boot_file" not in lease
+
+
+def test_every_value_type_reaches_the_client_as_it_was_given(
+    server, reservation, tmp_path, value_types
+):
+    backend, hosts, opts = server
+    backend.add(reservation(backend, {name: value for name, value, *_ in value_types}))
+    lease = _lease(hosts, opts, tmp_path, ask=[code for _, _, code, *_ in value_types])
+    got = {var: lease.get(var) for *_, var, _ in value_types}
+    assert got == {var: expected for *_, var, expected in value_types}
+
+
+def test_dnsmasq_reads_every_option_it_is_given(reservation, tmp_path, every_option):
+    # `_lease` fails on any line dnsmasq's log calls bad.
+    hosts, opts = tmp_path / "hosts", tmp_path / "opts"
+    backend = dhcpctl.connect(
+        f"dnsmasq:///?hostsfile={hosts.as_posix()}&optsfile={opts.as_posix()}"
+        "&reload=true"
+    )
+    backend.add(
+        reservation(backend, {f"option-{code}": value for code, value in every_option})
+    )
+    assert len(opts.read_text(encoding="utf-8").splitlines()) > 100
+    assert _lease(hosts, opts, tmp_path).get("ip") == "10.0.0.10"

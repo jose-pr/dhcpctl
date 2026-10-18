@@ -6,9 +6,8 @@ it:
 
 * the host object's `statements` are a fragment of dhcpd's **config language**,
   so every value interpolated into it is escaped or refused here;
-* a host added over OMAPI is **not** written to `dhcpd.conf`, and survives a
-  restart only if the server keeps it in a lease/host database. That is dhcpd's
-  design.
+* a host or group added over OMAPI is **not** written to `dhcpd.conf`: dhcpd
+  keeps it in its leases file, so it survives a restart that keeps that file.
 """
 
 from __future__ import annotations
@@ -19,7 +18,7 @@ import struct as _struct
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlsplit
 
-from pydhcp.options import Bytes, DomainList, OctetString, String
+from pydhcp.options import Bytes, DomainList, DomainName, OctetString, String
 
 from .._conditions import Condition
 from .._model import Reservation, Target
@@ -38,28 +37,145 @@ _STATEMENTS = (
     ("sname", "server-name"),
     ("siaddr", "next-server"),
 )
-#: Option code -> dhcpd's name for it; any other code is `unknown-<n>`, which
-#: dhcpd(8) takes as opaque octets.
+#: Option code -> dhcpd's name for it: every code ISC dhcpd 4.4 defines (what
+#: `dhcpd -t` reports when `unknown-<n>` is redefined). A value for one of these
+#: is written in that option's own syntax; any other code is `unknown-<n>`,
+#: which dhcpd(8) takes as opaque octets. Writing `unknown-<n>` for a code dhcpd
+#: knows makes it parse the value as that option's type, and refuse octets.
 _OPTIONS = {
-    DHCPOptionCode.ROUTER: "routers",  # dhcpd's own spelling is plural
-    DHCPOptionCode.DNS: "domain-name-servers",
-    DHCPOptionCode.DOMAIN_NAME: "domain-name",
-    DHCPOptionCode.DOMAIN_SEARCH: "domain-search",
-    DHCPOptionCode.NTP_SERVERS: "ntp-servers",
-    DHCPOptionCode.SUBNET_MASK: "subnet-mask",
-    DHCPOptionCode.BROADCAST_ADDRESS: "broadcast-address",
-    DHCPOptionCode.IP_ADDRESS_LEASE_TIME: "dhcp-lease-time",
-    DHCPOptionCode.TFTP_SERVER: "tftp-server-name",
-    DHCPOptionCode.BOOTFILE_NAME: "bootfile-name",
-    DHCPOptionCode.HOSTNAME: "host-name",
-    DHCPOptionCode.VENDOR_CLASS_IDENTIFIER: "vendor-class-identifier",
+    1: "subnet-mask",
+    2: "time-offset",
+    3: "routers",
+    4: "time-servers",
+    5: "ien116-name-servers",
+    6: "domain-name-servers",
+    7: "log-servers",
+    8: "cookie-servers",
+    9: "lpr-servers",
+    10: "impress-servers",
+    11: "resource-location-servers",
+    12: "host-name",
+    13: "boot-size",
+    14: "merit-dump",
+    15: "domain-name",
+    16: "swap-server",
+    17: "root-path",
+    18: "extensions-path",
+    19: "ip-forwarding",
+    20: "non-local-source-routing",
+    21: "policy-filter",
+    22: "max-dgram-reassembly",
+    23: "default-ip-ttl",
+    24: "path-mtu-aging-timeout",
+    25: "path-mtu-plateau-table",
+    26: "interface-mtu",
+    27: "all-subnets-local",
+    28: "broadcast-address",
+    29: "perform-mask-discovery",
+    30: "mask-supplier",
+    31: "router-discovery",
+    32: "router-solicitation-address",
+    33: "static-routes",
+    34: "trailer-encapsulation",
+    35: "arp-cache-timeout",
+    36: "ieee802-3-encapsulation",
+    37: "default-tcp-ttl",
+    38: "tcp-keepalive-interval",
+    39: "tcp-keepalive-garbage",
+    40: "nis-domain",
+    41: "nis-servers",
+    42: "ntp-servers",
+    43: "vendor-encapsulated-options",
+    44: "netbios-name-servers",
+    45: "netbios-dd-server",
+    46: "netbios-node-type",
+    47: "netbios-scope",
+    48: "font-servers",
+    49: "x-display-manager",
+    50: "dhcp-requested-address",
+    51: "dhcp-lease-time",
+    52: "dhcp-option-overload",
+    53: "dhcp-message-type",
+    54: "dhcp-server-identifier",
+    55: "dhcp-parameter-request-list",
+    56: "dhcp-message",
+    57: "dhcp-max-message-size",
+    58: "dhcp-renewal-time",
+    59: "dhcp-rebinding-time",
+    60: "vendor-class-identifier",
+    61: "dhcp-client-identifier",
+    62: "nwip-domain",
+    63: "nwip-suboptions",
+    64: "nisplus-domain",
+    65: "nisplus-servers",
+    66: "tftp-server-name",
+    67: "bootfile-name",
+    68: "mobile-ip-home-agent",
+    69: "smtp-server",
+    70: "pop-server",
+    71: "nntp-server",
+    72: "www-server",
+    73: "finger-server",
+    74: "irc-server",
+    75: "streettalk-server",
+    76: "streettalk-directory-assistance-server",
+    77: "user-class",
+    78: "slp-directory-agent",
+    79: "slp-service-scope",
+    81: "fqdn",
+    82: "relay-agent-information",
+    85: "nds-servers",
+    86: "nds-tree-name",
+    87: "nds-context",
+    88: "bcms-controller-names",
+    89: "bcms-controller-address",
+    91: "client-last-transaction-time",
+    92: "associated-ip",
+    93: "pxe-system-type",
+    94: "pxe-interface-id",
+    97: "pxe-client-id",
+    99: "geoconf-civic",
+    100: "pcode",
+    101: "tcode",
+    108: "v6-only-preferred",
+    112: "netinfo-server-address",
+    113: "netinfo-server-tag",
+    114: "default-url",
+    116: "auto-config",
+    117: "name-service-search",
+    118: "subnet-selection",
+    119: "domain-search",
+    121: "classless-static-routes",
+    124: "vivco",
+    125: "vivso",
+    136: "pana-agent",
+    137: "v4-lost",
+    138: "capwap-ac-v4",
+    141: "sip-ua-cs-domains",
+    142: "ipv4-address-andsf",
+    146: "rdnss-selection",
+    150: "tftp-server-address",
+    159: "v4-portparams",
+    160: "v4-captive-portal",
+    209: "loader-configfile",
+    210: "loader-pathprefix",
+    211: "loader-reboottime",
+    212: "option-6rd",
+    213: "v4-access-domain",
 }
 
 #: pydhcp codecs whose values dhcpd takes as quoted text, not as an address or
 #: a number.
 _TEXT_CODECS = (String, OctetString, DomainList)
+#: Codes pydhcp takes as octets that dhcpd defines with a structure of its own
+#: (text, addresses, a flag and addresses): `dhcpd -t` refuses octets for them.
+_STRUCTURED = frozenset({62, 77, 78, 79, 85, 86, 87, 98, 136, 137, 159, 212})
+#: Flags dhcpd defines as a number, not as `true`/`false`.
+_FLAG_AS_NUMBER = frozenset({116})
 #: What an unquoted value may contain: addresses, numbers, lists of them.
-_BARE = _re.compile(r"^(true|false|[0-9a-fA-F.:, ]+)$")
+_BARE = _re.compile(r"^(true|false|-?[0-9a-fA-F.:, ]+)$")
+#: A domain name as dhcpd takes one: bare, with no trailing dot.
+_DOMAIN = _re.compile(r"^[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)*$")
 
 
 class DHCPDBackend(DHCPServer):
@@ -118,6 +234,10 @@ class DHCPDBackend(DHCPServer):
                 return handle.read().strip()
         return self.secret("omapi_key")
 
+    def _recording(self, sent: List[str]) -> Any:
+        """Each OMAPI call, with its arguments; dhcpd holds no group yet."""
+        return self._replaced(omapi=lambda: _RecordedOmapi(sent))
+
     def omapi(self) -> Any:
         """An authenticated OMAPI connection to this dhcpd."""
         try:
@@ -165,6 +285,9 @@ class DHCPDBackend(DHCPServer):
         try:
             if group is not None:
                 self._ensure_group(connection, group, conditions)
+            # Re-arming replaces the client's host: OMAPI creates a host only
+            # when there is none, and cannot rewrite one's statements in place.
+            _delete_host(connection, host[1])
             # The group is set in the same create: a host that exists, even for
             # a moment, without it is a client served without its condition.
             connection.create_host(*host, statements=statements, group=group)
@@ -198,8 +321,8 @@ class DHCPDBackend(DHCPServer):
     ) -> None:
         """Use the group carrying these conditions, or create it.
 
-        An OMAPI group does not survive a restart; `condition_recipe` prints the
-        `dhcpd.conf` block that does.
+        dhcpd keeps an OMAPI group in its leases file; `condition_recipe`
+        prints the `dhcpd.conf` block for a server whose leases file is not kept.
 
         :raises ServerError: the group is not there and cannot be created.
         """
@@ -225,10 +348,10 @@ class DHCPDBackend(DHCPServer):
         return condition.name
 
     def condition_recipe(self, reservation: Reservation, condition: Condition) -> str:
-        """The `dhcpd.conf` group an admin can add, the durable alternative."""
+        """The `dhcpd.conf` group an admin can add, for when OMAPI cannot create it."""
         return (
-            f"# {self.owner}: add to dhcpd.conf so {condition.name!r} survives a "
-            f"restart\n"
+            f"# {self.owner}: add to dhcpd.conf so {condition.name!r} need not be "
+            f"created over OMAPI\n"
             f'group "{condition.name}" {{\n'
             f"  {render_condition(condition)}\n"
             f"}}"
@@ -256,6 +379,26 @@ class DHCPDBackend(DHCPServer):
             _delete_host(connection, mac)
         finally:
             _close(connection)
+
+
+class _RecordedOmapi:
+    """Stands in for an OMAPI connection: each call becomes a line of `sent`."""
+
+    def __init__(self, sent: List[str]) -> None:
+        self._sent = sent
+
+    def __getattr__(self, name: str) -> Any:
+        def call(*args: Any, **kwargs: Any) -> None:
+            if name != "close":
+                lines = [" ".join([name, *map(str, args)])]
+                lines += [
+                    f"  {key}: {value}"
+                    for key, value in kwargs.items()
+                    if value is not None
+                ]
+                self._sent.append("\n".join(lines))
+
+        return call
 
 
 def _host(reservation: Reservation) -> Tuple[str, str, str]:
@@ -441,7 +584,13 @@ def render_statements(lease: DHCPLease, extras: Optional[List[Any]] = None) -> s
     for key, value in plain_items(lease.options):
         codec = key.get_type()
         text = issubclass(codec, _TEXT_CODECS)
-        if key not in _OPTIONS:
+        if int(key) in _STRUCTURED and issubclass(codec, Bytes) and not text:
+            raise ConfigError(
+                f"dhcpd defines option {int(key)} with a structure of its own, so "
+                "it cannot be given as octets; pass dhcpd's own statement through "
+                "the reservation's extras"
+            )
+        if int(key) not in _OPTIONS:
             # dhcpd knows no name for it: `unknown-<n>` takes quoted text or
             # the option's octets.
             option = f"unknown-{int(key)}"
@@ -453,9 +602,20 @@ def render_statements(lease: DHCPLease, extras: Optional[List[Any]] = None) -> s
         if issubclass(codec, Bytes) and not text:
             # dhcpd reads octets as colon-separated hex.
             value = ":".join(value[i : i + 2] for i in range(0, len(value), 2))
+        elif issubclass(codec, DomainName):
+            # dhcpd's domain-name type is a bare name; quoted, it is refused.
+            if not _DOMAIN.match(str(value)):
+                raise ConfigError(
+                    f"dhcpd option {_OPTIONS[int(key)]!r} takes a domain name, not "
+                    f"{value!r}"
+                )
+            parts.append(f"option {_OPTIONS[int(key)]} {value};")
+            continue
+        elif isinstance(value, bool) and int(key) in _FLAG_AS_NUMBER:
+            value = int(value)
         elif isinstance(value, bool):
             value = "true" if value else "false"
-        option = _OPTIONS[key]
+        option = _OPTIONS[int(key)]
         parts.append(f"option {option} {_render(option, value, text)};")
     for field, keyword in _STATEMENTS:
         value = getattr(lease, field)

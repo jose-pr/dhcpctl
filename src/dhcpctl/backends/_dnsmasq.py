@@ -13,6 +13,7 @@ reached over `sftp://`.
 
 from __future__ import annotations
 
+import contextlib as _contextlib
 import hashlib as _hashlib
 import logging
 import os as _os
@@ -20,6 +21,11 @@ import shlex as _shlex
 import subprocess as _subprocess
 from typing import Any, List, Optional, Tuple
 from urllib.parse import urlsplit
+
+from hostctl.shell import Exec
+from pydhcp.options import I32, U8, U16, U32, Boolean, Bytes, DomainList
+from pydhcp.options import List as CodecList
+from pydhcp.options import OctetString, String
 
 from .._conditions import MATCH_KEYS, Condition
 from .._model import Reservation, Target
@@ -60,7 +66,7 @@ class DnsmasqBackend(DHCPServer):
         super().__init__(uri, secrets=secrets, owner=owner, codes=codes)
         parts = urlsplit(uri)
         self.host = parts.hostname or ""
-        self.user = parts.username or ""
+        self.user = self.secret("user") or ""
 
         hostsfile = self.settings.get("hostsfile") or parts.path
         if not hostsfile or hostsfile == "/":
@@ -155,6 +161,27 @@ class DnsmasqBackend(DHCPServer):
             took |= self._write("opts", tag, [])
         self._reload(took)
 
+    def _recording(self, sent: List[str]) -> Any:
+        """Each entry as the lines written, under the path it goes to, and the
+        reload command. A path is a directory only when it ends with `/`: the
+        file system is not asked."""
+
+        def write(which: str, tag: str, lines: List[str]) -> bool:
+            base = self.hostsfile if which == "hosts" else self.optsfile
+            path = base / f"{tag}.conf" if self._slashed[which] else base
+            shown = path.as_posix() if hasattr(path, "as_posix") else str(path)
+            where = f"# {which}: {shown}" + (
+                "" if self._slashed[which] else f" [{tag}]"
+            )
+            sent.append("\n".join([where, *lines]) if lines else where + ": removed")
+            return False
+
+        def reload(took_away: bool) -> None:
+            if self.reload_command and self.reload_command != "signal":
+                sent.append(f"# reload: {self.reload_command}")
+
+        return self._replaced(_write=write, _reload=reload)
+
     def _require_optsfile(self, options: List[str]) -> None:
         """Refuse to arm a client whose options would have nowhere to go."""
         if options and self.optsfile is None:
@@ -213,7 +240,16 @@ class DnsmasqBackend(DHCPServer):
         return before is not None
 
     def _write_region(self, path: Any, tag: str, lines: List[str]) -> bool:
-        """Replace only the owner's marked region, leaving every other line."""
+        """Replace only the owner's marked region, leaving every other line.
+
+        The file is read, edited and replaced whole, so a local one is locked
+        for that time: two writers would otherwise each drop the other's
+        region. A remote file has no lock to take.
+        """
+        with _locked(path):
+            return self._rewrite_region(path, tag, lines)
+
+    def _rewrite_region(self, path: Any, tag: str, lines: List[str]) -> bool:
         start = f"# >>> {self.owner} {tag}"
         end = f"# <<< {self.owner} {tag}"
         try:
@@ -247,7 +283,9 @@ class DnsmasqBackend(DHCPServer):
             parent.mkdir(parents=True, exist_ok=True)
         except (FileExistsError, NotImplementedError):
             pass
-        tmp = parent / f"{path.name}.{self.owner}-tmp"
+        # Per process, so two writers never share one; a dotfile, which dnsmasq
+        # skips when it reads a --dhcp-hostsdir or --dhcp-optsdir.
+        tmp = parent / f".{path.name}.{self.owner}-{_os.getpid()}-tmp"
         try:
             tmp.write_text(text, encoding="utf-8")
             _replace(tmp, path)
@@ -299,12 +337,15 @@ class DnsmasqBackend(DHCPServer):
             return
 
         argv = _shlex.split(self.reload_command)
-        if self.host:
-            destination = f"{self.user}@{self.host}" if self.user else self.host
-            argv = ["ssh", destination, *argv]
-        LOGGER.debug("dnsmasq reload: %s", argv)
+        LOGGER.debug("dnsmasq reload on %s: %s", self.host or "this host", argv)
         try:
-            _subprocess.run(argv, check=True, timeout=60)
+            with _open_host(self.reload_host()) as host:
+                host.run(Exec(*argv), timeout=60)
+        except ImportError as exc:
+            raise BackendUnavailableError(
+                "reloading a remote dnsmasq over ssh requires the 'ssh' extra: "
+                "pip install pydhcpctl[ssh]"
+            ) from exc
         except _subprocess.CalledProcessError as exc:
             raise ServerError(
                 f"dnsmasq: reload command {argv!r} failed ({exc.returncode})"
@@ -317,6 +358,24 @@ class DnsmasqBackend(DHCPServer):
             raise ServerError(
                 f"dnsmasq: cannot run reload command {argv!r}: {exc}"
             ) from exc
+
+    def reload_host(self) -> Any:
+        """The hostctl config `reload=` runs on: this machine, or the URI's host
+        over ssh."""
+        import hostctl
+
+        if not self.host:
+            return hostctl.LocalConfig()
+        return hostctl.SSHConfig(
+            self.host,
+            username=self.user or None,
+            password=self.secret("password") or None,
+        )
+
+
+def _open_host(config: Any) -> Any:
+    """An open hostctl host for `config`, closed by `with`."""
+    return config.open()
 
 
 def _require_sftp(uri: str) -> None:
@@ -366,14 +425,41 @@ def _option_lines(
         if value:
             lines.append(f"tag:{tag},option:{name},{value}")
     for code, value in _codes(lease.options):
-        lines.append(f"tag:{tag},{code},{_value(value)}")
+        lines.append(f"tag:{tag},{code},{value}")
     lines.extend(str(line) for line in (extras or ()))
     return lines
 
 
-def _codes(options: DHCPOptions) -> List[Tuple[str, Any]]:
-    """Options as (dnsmasq option code, plain value)."""
-    return [(str(int(code)), value) for code, value in plain_items(options)]
+#: Codecs whose value dnsmasq would read as text unless given as octets.
+_OCTETS = (Bytes, Boolean, U8, U16, U32, I32)
+_TEXT_CODECS = (String, OctetString, DomainList)
+
+
+def _codes(options: DHCPOptions) -> List[Tuple[str, str]]:
+    """Options as (dnsmasq option code, the value as dnsmasq reads it)."""
+    return [
+        (str(int(code)), _option_value(options, code, value))
+        for code, value in plain_items(options)
+    ]
+
+
+def _option_value(options: DHCPOptions, code: Any, value: Any) -> str:
+    """A number, flag or octets as their encoded octets; anything else as text.
+
+    dnsmasq reads `True` and `0a0b` as text, and sizes a bare number by its
+    value for an option it has no type for; colon-separated hex is the octets
+    exactly. One octet is written as a number: alone, `0a` is text to dnsmasq.
+    """
+    codec = code.get_type()
+    if issubclass(codec, CodecList):
+        # A list of numbers too: dnsmasq takes `576,1500` for addresses.
+        codec = codec.item_type()
+    if not issubclass(codec, _OCTETS) or issubclass(codec, _TEXT_CODECS):
+        return _value(value)
+    raw = bytes(options[int(code)])
+    if len(raw) == 1:
+        return str(raw[0])
+    return ":".join(f"{octet:02x}" for octet in raw)
 
 
 def _value(value: Any) -> str:
@@ -391,6 +477,40 @@ def _is_directory(path: Any) -> bool:
         return path.is_dir()
     except (NotImplementedError, OSError):  # pragma: no cover - exotic path types
         return False
+
+
+@_contextlib.contextmanager
+def _locked(path: Any) -> Any:
+    """Hold an exclusive lock on `.<name>.lock` beside `path`, a local file.
+
+    A dotfile, so a `conf-dir` holding the file does not read it as config.
+    """
+    try:
+        name = _os.fspath(path)
+    except TypeError:
+        yield  # a remote path
+        return
+    _os.makedirs(_os.path.dirname(name) or ".", exist_ok=True)
+    directory, base = _os.path.split(name)
+    with open(_os.path.join(directory, f".{base}.lock"), "a+b") as handle:
+        if _os.name == "nt":
+            import msvcrt
+
+            # LK_LOCK retries for ten seconds, then raises OSError.
+            msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+            try:
+                yield
+            finally:
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 def _replace(tmp: Any, path: Any) -> None:
