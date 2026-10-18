@@ -88,8 +88,10 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y dnsmasq-base isc-dhcp-server udhcpc
-          # Ubuntu confines unprivileged user namespaces with AppArmor.
+          # Ubuntu confines unprivileged user namespaces with AppArmor, and
+          # its dhcpd profile refuses a config outside /etc/dhcp.
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          sudo apparmor_parser -R /etc/apparmor.d/usr.sbin.dhcpd || true
       - name: Install package with all extras
         run: python -m pip install -e ".[dev]"
       - name: Run the real-peer tests

@@ -35,8 +35,8 @@ dependencies = [
     # codecs that check each value and give netsh its data types (0.9.0).
     "pydhcp>=0.9.0,<0.10",
     # dnsmasq's hosts/opts paths, local or a URI; the 0.1 series is the first
-    # with the `uripath` import name.
-    "pathapi>=0.1.0,<0.2",
+    # with the `uripath` import name, and hostctl 0.4 needs 0.1.2.
+    "pathapi>=0.1.2,<0.2",
     "pathapi-uri>=0.1.0,<0.2",
     # The shell a backend runs commands in: local, ssh or WinRM. Its core
     # needs only pathapi and netimps; each remote transport is an extra.
