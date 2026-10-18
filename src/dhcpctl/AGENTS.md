@@ -469,6 +469,24 @@ message). A failure reaching a Windows or dnsmasq host (refused, unreachable,
 a login refused, a timeout) is a `ServerError`; an OMAPI connection's own
 exception from pypureomapi is not wrapped.
 
+## Testing a backend (`dhcpctl.testing`)
+
+- **`BackendContract`** — subclass it in a pytest module and set `uri` (a URI
+  building the backend, with no I/O), optionally `secret_uri` (the same with
+  `{secret}` where a password goes; None skips that test) and `keyed_by_mac`
+  (default True). The inherited tests check, through `render` and so with no
+  server: building from the URI; a URI with an option (`router=`) is a
+  `ConfigError`; a password is in no `str`/`repr`/`redacted_uri`; arming
+  renders text naming the client (its MAC in any spelling, or its name),
+  removing and keeping render, completing without keeping renders exactly
+  as removing; a client with no MAC is `MissingMACError`; a condition is
+  served (`boot.ipxe` in the text, a recipe string) or refused with a
+  `ConditionUnsupportedError` naming it; an unknown action or phase is
+  `ValueError`. `.server()` and `.reservation(server, **changes)` (`web01`,
+  10.0.0.10 in 10.0.0.0/24, Kea subnet 1; `mac=None` drops the MAC) are the
+  helpers. Needs pytest; `import dhcpctl` never imports it.
+- **`SECRET`** — the text `{secret}` is replaced with.
+
 ## Command line
 
 `pip install pydhcpctl[cli]` (duho); `dhcpctl` and `python -m dhcpctl` run

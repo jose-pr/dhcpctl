@@ -11,6 +11,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 - `DHCPServer.render(reservation, action="add")`: what an operation would
   send, contacting nothing, on every shipped backend.
+- `dhcpctl.testing.BackendContract`: the suite every shipped backend passes,
+  for a third-party backend to run unmodified; it talks to no server.
 - The `dhcpctl` command line (`pydhcpctl[cli]`): `render`, `add`,
   `complete`, `remove`, `recipe` and `backends`, a reservation given by flags
   or a document, secrets from `DHCPCTL_*` variables.
@@ -71,7 +73,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   defines with a structure of its own are a `ConfigError`. dnsmasq: a flag,
   a number list and octets are written as octets (`True`, `576,1500` and
   `0a0b` were text or refused). Kea: octets go with `csv-format` off, a flag
-  as `true`. Windows: a flag is 1 or 0. Checked by sending every option of a
+  as `true`. Windows: a flag is 1 or 0, and a negative number the DWORD it
+  stores (it refused `-3600` for option 2). Checked by sending every option of a
   plain codec through a real dhcpd (`dhcpd -t`) and dnsmasq, and one of each
   codec to a real client (`tests/test_dhcpd_real.py`,
   `tests/test_dnsmasq_real.py`).
@@ -97,7 +100,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   ssh is asyncssh, through `hostctl[ssh]`, rather than the system `ssh`
   client; it reads `~/.ssh/config` as `ssh` does, and the `ssh` extra now
   serves windhcp over ssh too. Checked against real Windows PowerShell 5.1
-  (`tests/test_windhcp_delivery.py`).
+  (`tests/test_windhcp_delivery.py`), and against a live Windows Server 2025
+  DHCP server over ssh with both methods: arm, re-arm, keep and remove, the
+  policies included (`tests/test_windhcp_live.py`, opt-in).
 - The Windows backend removes a target's own policies when it removes the
   target (they kept answering its MAC); leaves an existing shared policy as it
   is, and trusts it on a host without the DhcpServer module; prints, in target

@@ -150,6 +150,16 @@ or declare it in your package's metadata:
 recorder = "mypkg.dhcp:Recorder"
 ```
 
+A backend is done when it passes the contract the shipped ones pass, which
+talks to no server (it needs pytest, and the backend to implement `render`):
+
+```python
+from dhcpctl.testing import BackendContract
+
+class TestRecorder(BackendContract):
+    uri = "recorder://anything"
+```
+
 ## License
 
 MIT

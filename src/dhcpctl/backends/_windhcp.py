@@ -1093,7 +1093,15 @@ def _option_ids(options: DHCPOptions) -> List[Tuple[int, Any]]:
     and joining it here would have made the second impossible.
     """
     return [
-        (int(code), value)
+        (int(code), _unsigned(value))
         for code, value in plain_items(options)
         if code not in _SKIPPED
     ]
+
+
+def _unsigned(value: Any) -> Any:
+    """A negative number as the DWORD Windows stores: it refuses `-3600` for
+    option 2 (WIN32 87) and takes its two's complement."""
+    if isinstance(value, int) and not isinstance(value, bool) and value < 0:
+        return value % 2**32
+    return value
