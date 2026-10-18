@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- `DHCPServer.render(reservation, action="add")`: what an operation would
+  send, contacting nothing, on every shipped backend.
+- The `dhcpctl` command line (`pydhcpctl[cli]`): `render`, `add`,
+  `complete`, `remove`, `recipe` and `backends`, a reservation given by flags
+  or a document, secrets from `DHCPCTL_*` variables.
 - Published as `pydhcpctl`; the import package is `dhcpctl`.
 - `connect(uri, *, secrets=None, owner="dhcpctl")`, `register_backend`,
   `unregister_backend`, `backend_names`, `get_backend` and the
@@ -54,14 +59,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   arming the client without them; a trailing `/` on a path that does not exist
   yet means a directory; names that reduce to one tag get distinct tags; a
   missing or hung reload command, an unreadable pidfile and a platform without
-  SIGHUP are errors instead of a stray exception or SIGTERM.
-- The Windows backend's local and ssh transports deliver the script whole: a
-  fixed `-EncodedCommand` bootstrap reads it from standard input and runs it
-  as one scriptblock. netboot piped it into `powershell -Command -`, which runs
-  only the first line of a multi-line block and exits 0 even when a cmdlet
-  fails, so reservations were reported armed and were not. A script that
-  ends without printing its closing `{"ok": true}` is now a `ServerError`.
-  Checked against real Windows PowerShell 5.1 and pwsh 7
+  SIGHUP are errors instead of a stray exception or SIGTERM. A local hosts or
+  options file is rewritten under a lock on `.<file>.lock`, so two runs at once
+  no longer drop each other's entries.
+- Every option reaches each server in a form it reads. dhcpd: an option it
+  defines is written under its name in its own syntax (119 codes, taken from
+  dhcpd 4.4 itself); netboot wrote `unknown-<n>` and octets for all but a
+  dozen, which dhcpd parses as the option's own type, so it refused the
+  host's statements and served none of them (70 of 134 options). Negative
+  numbers and domain names are written bare, and octets for an option dhcpd
+  defines with a structure of its own are a `ConfigError`. dnsmasq: a flag,
+  a number list and octets are written as octets (`True`, `576,1500` and
+  `0a0b` were text or refused). Kea: octets go with `csv-format` off, a flag
+  as `true`. Windows: a flag is 1 or 0. Checked by sending every option of a
+  plain codec through a real dhcpd (`dhcpd -t`) and dnsmasq, and one of each
+  codec to a real client (`tests/test_dhcpd_real.py`,
+  `tests/test_dnsmasq_real.py`).
+- Re-arming a client replaces what the server holds for it, on every
+  backend: dhcpd and Kea refused, and the Windows cmdlet threw.
+- Kea conditions work: a condition is a client class of the client's own,
+  tested on its MAC and `option[n].hex` (iPXE's flat option 77 never matched
+  `.text`), and what it overrides is served by a second class of the
+  client's when it does not match, since Kea serves a reservation's values
+  over any class's. The reservation names no `client-classes`, which put the
+  client in the class whatever its test said: on a real Kea every client was
+  handed the reservation's boot file, iPXE or not. `?target=memory` (host_cmds'
+  `operation-target`) arms a Kea with no hosts database. Checked against a
+  real Kea 3.0.4 (`tests/test_kea_real.py`).
+- Commands run through hostctl hosts: the Windows backend's local, ssh and
+  WinRM transports (`hostctl.LocalConfig`, `SSHConfig`, `WinRMConfig`) and a
+  dnsmasq `reload=`, locally or over ssh. hostctl delivers a PowerShell script
+  whole; netboot piped it into `powershell -Command -`, which runs only the
+  first line of a multi-line block and exits 0 even when a cmdlet fails, so
+  reservations were reported armed and were not. A script that ends without
+  printing its closing `{"ok": true}` is a `ServerError`, as are an
+  unreachable host, a refused login and a timeout (`timeout=`, default 120 s).
+  ssh is asyncssh, through `hostctl[ssh]`, rather than the system `ssh`
+  client; it reads `~/.ssh/config` as `ssh` does, and the `ssh` extra now
+  serves windhcp over ssh too. Checked against real Windows PowerShell 5.1
   (`tests/test_windhcp_delivery.py`).
 - The Windows backend removes a target's own policies when it removes the
   target (they kept answering its MAC); leaves an existing shared policy as it

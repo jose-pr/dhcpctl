@@ -10,11 +10,13 @@ Every public name is importable from `dhcpctl`; `dhcpctl.exceptions` and
 `dhcpctl.backends` (the four backend classes, imported lazily) are public too.
 Modules whose name starts with an underscore are private.
 
-`pip install pydhcpctl` (the distribution; the import package is `dhcpctl`) needs `netimps`, `pydhcp`, `pathapi` and `pathapi-uri`. Each
-backend's library is an extra, imported only when a URI with its scheme is
-first **used** (building a server needs none): `kea` (requests), `dhcpd`
-(pypureomapi), `winrm` (pywinrm), `ssh` (sftppath with paramiko, for dnsmasq
-`sftp://` paths). A missing one raises `BackendUnavailableError` naming
+`pip install pydhcpctl` (the distribution; the import package is `dhcpctl`) needs `netimps`, `pydhcp`, `pathapi`, `pathapi-uri` and
+`hostctl`, whose hosts run every command a backend runs (locally, over ssh,
+over WinRM). Each backend's library is an extra, imported only when a URI with
+its scheme is first **used** (building a server needs none): `kea`
+(requests), `dhcpd` (pypureomapi), `winrm` (`hostctl[winrm]`), `ssh`
+(`hostctl[ssh]` and `sftppath[uri]`: windhcp over ssh, and a remote dnsmasq's
+`sftp://` paths and reload). A missing one raises `BackendUnavailableError` naming
 `pydhcpctl[<extra>]`; `formats` (pydhcp's pktcap) adds YAML, TOML and INI
 to `Reservation.to_text`. `dhcpctl.__version__` is the installed distribution's version. Python 3.9+.
 
@@ -83,8 +85,10 @@ given. `URI_SECRETS` (class attribute) maps the URI's `username`/`password`
 parts to secret names. Methods take a `Reservation`:
 
 - **`add(r)`** — arm. Every shipped backend ensures `r.conditions` first, so a
-  refusal leaves nothing half-applied. Re-arming an existing entry is backend
-  specific (Kea raises `ReservationExistsError`).
+  refusal leaves nothing half-applied. **Re-arming replaces** the entry the
+  server holds for this client (by MAC), with its options, on every shipped
+  backend: dnsmasq rewrites its entry, dhcpd deletes and creates the host, Kea
+  `reservation-update`s, Windows removes and adds the reservation.
 - **`remove(r)`** — disarm; removing what is not there succeeds.
 - **`keep(r)`** — keep the entry serving `r.completion.apply_to(r.lease)`. Base
   raises `NotImplementedError`; all four shipped backends implement it.
@@ -98,6 +102,16 @@ parts to secret names. Methods take a `Reservation`:
   applies, as text, never run. Same text the error carries. Base: `""`.
 - **`remove_condition_member(r, condition)`** — detach this client from a
   shared construct, never deleting it. Base: no-op.
+- **`render(r, action="add") -> str`** — what `add`, `keep`, `complete` or
+  `remove` would send, **contacting nothing**: the backend's own text, one
+  step after another (dnsmasq: each entry's lines under the path they go to,
+  a directory only when the setting ends with `/`, then the reload command;
+  Kea: each command's JSON body; dhcpd: each OMAPI call; Windows: each
+  PowerShell script, payload included). A step that would read the server is
+  answered "nothing there yet" (Kea asks for the scope's subnet id instead of
+  reading its config). An unknown action is `ValueError`; a backend without
+  a recorder raises `NotImplementedError` -- a subclass makes `_recording(sent)`
+  return a context in which what it sends is appended to `sent`.
 - **`extras(r, phase="add") -> list`** — backend-native fragments, emitted
   **verbatim** after the modelled options: `r.extras[phase]`. Override it to
   decide per client (`r.context` is the caller's), calling `super()`. `phase`
@@ -273,11 +287,19 @@ Per backend:
   `dhcp-match` line in dnsmasq's main config, which the opts file cannot hold.
   The message and recipe give the `dhcp-match` line and the condition's
   `dhcp-option` lines.
-- **Kea**: `class-get`, else `class-add` (needs the `class_cmds` hook; without
-  it `ConditionMissingError` with the `client-classes` JSON); the reservation
-  names its classes in `client-classes`. A class carries the header fields as
-  `next-server`, `server-hostname`, `boot-file-name`. A match value with a
-  quote or newline is a `ConfigError`.
+- **Kea**: a client class of this client's own, `<condition>-<mac hex>`,
+  tested `pkt4.mac == 0x<mac> and option[<code>].hex == '<value>'` (`.hex`:
+  iPXE sends option 77 as a flat string); `class-update` when Kea has it, else
+  `class-add` (needs the `class_cmds` hook; without it `ConditionMissingError`
+  with the `client-classes` JSON). Kea serves a reservation's values over any
+  class's, so a value a condition overrides is not in the reservation but in a
+  second class, `<owner>-<mac hex>`, tested `pkt4.mac == 0x<mac> and not
+  member('<condition class>')...`; the reservation names no `client-classes`
+  (that would put the client in them whatever their tests). Leaving a
+  condition and `remove` delete both classes (the second first). A class
+  carries the header fields as `next-server`, `server-hostname`,
+  `boot-file-name`. A match value with a quote or newline is a `ConfigError`.
+  Checked against a real Kea 3.0.4 (`tests/test_kea_real.py`).
 - **dhcpd**: `conditions=if` (default) inlines `if exists user-class and option
   user-class = "..." { ... }` on the host; `conditions=group` uses the group
   named after the conditions (joined by `-`), creating it when an OMAPI
@@ -285,7 +307,8 @@ Per backend:
   armed), and creates the host in it. A host's statements outrank its
   group's, so in group mode each value a condition overrides is the host's
   only in the `else` of that condition's test. The recipe is a durable
-  `dhcpd.conf` `group` block (OMAPI groups vanish on restart).
+  `dhcpd.conf` `group` block, for a server where OMAPI may not create one (an
+  OMAPI group, like a host, is kept in dhcpd's leases file across a restart).
 - **windhcp**: scope-level policies through the cmdlets (**netsh has no policy
   verb**), creating the user/vendor class first. **A reservation's options
   outrank every policy**, so an option id a condition overrides is left off the
@@ -330,7 +353,10 @@ Per backend:
   Writes `<mac>,set:<tag>[,ip][,hostname]` to `hostsfile` and
   `tag:<tag>,<code>,<value>` lines plus extras to `optsfile`: each line is the
   value of `--dhcp-host` / `--dhcp-option` without the key, as dnsmasq(8)
-  reads those files, and an extras line is written the same way. The header
+  reads those files, and an extras line is written the same way. A number,
+  flag, number list or octets value is its encoded octets as colon hex (one
+  octet as a decimal number: alone, `0a` is text to dnsmasq); addresses and
+  text as written. The header
   fields are `option:bootfile-name`, `option:tftp-server` and
   `option:server-ip-address` (dnsmasq fills the file field from the first
   unless the client asks for option 67). A
@@ -342,7 +368,9 @@ Per backend:
   anything is written. The tag is the target's name; a name with characters a
   tag cannot hold is reduced and gets an 8-hex digest of itself appended, so
   two names never share a tag. **Reloading**: `reload=` runs a command every
-  time (over `ssh <host>` when the URI has a host), `reload=signal` SIGHUPs
+  time, as an argv through a hostctl host (this machine, or the URI's host
+  over ssh with the `user`/`password` secrets, which needs the `ssh` extra),
+  bounded at 60 s; `reload=signal` SIGHUPs
   `pidfile` (default `/run/dnsmasq/dnsmasq.pid`) locally. With no `reload`, a
   file is a `ConfigError`; a directory needs nothing for a new entry, and
   SIGHUPs `pidfile` locally when an entry dnsmasq may have read is removed or
@@ -351,51 +379,66 @@ Per backend:
   asking for `reload=`. A failing, missing or hung (60 s) reload command, or a
   pidfile that cannot be signalled, is a `ServerError`; a platform with no
   SIGHUP is a `ConfigError`. Writes go through a sibling temporary file and a
-  rename where the path type allows.
-- **`KeaBackend`** — `kea://[user[:password]@]host[:8000]/?service=dhcp4`
+  rename where the path type allows (both dotfiles, which dnsmasq skips in a
+  directory); a local **file** is rewritten under an
+  exclusive lock on `.<file>.lock`, so concurrent writers keep each other's
+  regions (a remote `sftp://` file is not locked).
+- **`KeaBackend`** — `kea://[user[:password]@]host[:8000]/?service=dhcp4&target=`
   (account from the `user`/`password` secrets: no user, no auth),
   `keas://` for https; `service=dhcp4` only (anything else is a
   `ConfigError`). `reservation-add` / `reservation-del` (needs the
   `host_cmds` hook and a writable hosts backend; result 2 is explained).
-  Keeping and detaching a class rewrite the reservation with
+  `target=` is sent as host_cmds' `operation-target` (`memory`, `database`,
+  `all`, `default`; Kea 2.7.4+): `memory` keeps reservations in the running
+  configuration, which is how a Kea with no hosts database takes them (it
+  otherwise answers "Host database not available", and the error says so).
+  Keeping rewrites the reservation with
   `reservation-update`, or, on a Kea without it (result 2), `reservation-del`
   then `reservation-add`; every result is checked. A scope's subnet id is
   found among `subnet4` and every `shared-networks` entry's `subnet4`.
   The header fields are the reservation's `next-server`, `server-hostname`
   and `boot-file-name`, option 12 its `hostname`, the rest `option-data`
   entries **by code** (`{"code": 3, "data": ...}`: Kea's option names are not
-  pydhcp's), extras appended to `option-data`. Kea's spellings
+  pydhcp's; octets as hex with `"csv-format": false`, a flag as `true`/`false`),
+  extras appended to `option-data`. Kea's spellings
   (`OPTION_NAMES`) include `boot-file-name` and `server-hostname` for the
-  fields. Existing reservation -> `ReservationExistsError`; other
-  refusals and HTTP failures -> `ServerError`. `.command(name, arguments)`
+  fields. An existing reservation is replaced (`reservation-update`, or
+  delete and add); other refusals and HTTP failures -> `ServerError`. `.command(name, arguments)`
   sends one command.
 - **`DHCPDBackend`** — `dhcpd://[keyname[:key]@]host[:7911]/?keyname=&keyfile=&conditions=if|group`.
-  An OMAPI host, created exclusively (arming a host that exists is a
-  `ServerError`; nothing is overwritten) and deleted with `del_host`
+  An OMAPI host, deleted and created again on each arm (OMAPI cannot rewrite
+  a host's statements in place) and deleted with `del_host`
   (not-found on remove is fine). The lease becomes `statements`: its options
-  named by dhcpd's own table (`routers`, `domain-name-servers`,
-  `bootfile-name`, ...; any other code `unknown-<n>`, quoted text or its
-  octets), then `filename`, `server-name` and `next-server`
+  named by dhcpd's own table (every code dhcpd 4.4 defines: `routers`,
+  `domain-name-servers`, `bootfile-name`, ...) in that option's syntax, any
+  other code `unknown-<n>` with quoted text or its octets; octets for one of
+  the codes dhcpd defines with a structure of its own (62, 77-79, 85-87, 98,
+  136, 137, 159, 212) are a `ConfigError`; then `filename`, `server-name` and `next-server`
   for the header fields (also the names dhcpd's `OPTION_NAMES` reads): a value whose
   pydhcp codec is text (`String`, `OctetString`, `DomainList`) is quoted with
-  `"`/`\` escaped, others must look like addresses or numbers, a newline or
+  `"`/`\` escaped, a `DomainName` written bare, others must look like
+  addresses or (signed) numbers, a newline or
   NUL is a `ConfigError`. `keyname` with no key is a `ConfigError`. `.omapi()` opens a
   connection: pypureomapi's, with `create_host(ip, mac, name, statements=,
   group=)` and `group_exists(name)` added. Checked against a real ISC dhcpd
   4.4 (`tests/test_dhcpd_real.py`). **`render_statements(lease, extras=None)`** and
   **`render_condition(condition)`** are importable from
-  `dhcpctl.backends._dhcpd` for testing. OMAPI hosts do not survive a dhcpd
-  restart by themselves.
-- **`WinDHCPBackend`** — `windhcp://[user@]host/?transport=local|ssh|winrm&method=powershell|netsh&server=&auth=&port=&ssl=&conditions=target|shared`.
-  `transport` is how a shell is reached: `local` (default for an **empty** host;
-  `ConfigError` off Windows), `ssh` (default for a named host; the system
-  client) or `winrm` (pywinrm, `auth` default `ntlm`, `ssl` for https,
-  password secret). Locally and over ssh the script goes on standard input to
-  `POWERSHELL_ARGV`, a fixed `-EncodedCommand` bootstrap that reads it whole
-  and runs it as one scriptblock (`-Command -` runs a multi-line block's first
-  line only and exits 0); an error ends the run with status 1 and its message
-  as plain text. On every transport a script whose output lacks its closing
-  `{"ok": true}` is a `ServerError`.
+  `dhcpctl.backends._dhcpd` for testing. dhcpd keeps an OMAPI host in its
+  leases file, so it survives a restart that keeps that file.
+- **`WinDHCPBackend`** — `windhcp://[user@]host/?transport=local|ssh|winrm&method=powershell|netsh&server=&auth=&port=&ssl=&timeout=&conditions=target|shared`.
+  `transport` is how a shell is reached, as a hostctl host
+  (**`.host_config()`** returns its config): `local` (`LocalConfig`; default
+  for an **empty** host; `ConfigError` off Windows), `ssh` (`SSHConfig` with
+  the PowerShell shell and a Windows path flavour, so a Windows OpenSSH
+  server's `cmd.exe` login shell is allowed for; default for a named host;
+  the `user`/`password` secrets, then `~/.ssh/config` and the keys as `ssh`
+  finds them) or `winrm` (`WinRMConfig`, `auth` default `ntlm`, `ssl`
+  for https, the password secret). hostctl delivers the script whole and
+  reports its status; `timeout=` (seconds, default 120) bounds one script. A
+  non-zero status is a `ServerError` with its error text, and so are an
+  unreachable host, a refused login and an expired timeout; a missing
+  transport extra is a `BackendUnavailableError`. A script whose output lacks
+  its closing `{"ok": true}` is a `ServerError`.
   `method` is what runs: `powershell` (DhcpServer cmdlets) or `netsh` (invoked
   from PowerShell as `& netsh @a`, one argument per array element, judged by
   `$LASTEXITCODE`, state read back with `netsh ... dump` because netsh reports
@@ -419,11 +462,42 @@ Per backend:
 `DHCPCtlError` is the base of all. `ConfigError(DHCPCtlError, ValueError)`;
 `UnknownBackendError(ConfigError)`; `BackendUnavailableError(DHCPCtlError,
 ImportError)`; `MissingMACError(DHCPCtlError, LookupError)`;
-`ServerError(DHCPCtlError)`; `ReservationExistsError(ServerError)`;
+`ServerError(DHCPCtlError)`;
 `ConditionUnsupportedError(DHCPCtlError)`;
 `ConditionMissingError(DHCPCtlError)` with `.recipe` (also appended to the
-message). A transport's own exception (a timeout, a refused connection from
-pypureomapi or pywinrm) is not wrapped.
+message). A failure reaching a Windows or dnsmasq host (refused, unreachable,
+a login refused, a timeout) is a `ServerError`; an OMAPI connection's own
+exception from pypureomapi is not wrapped.
+
+## Command line
+
+`pip install pydhcpctl[cli]` (duho); `dhcpctl` and `python -m dhcpctl` run
+**`dhcpctl.cli.main(argv=None) -> int`**, which without the extra exits with one
+line naming it. `import dhcpctl` never imports `dhcpctl.cli`.
+
+- `dhcpctl render URI <reservation> [-a add|keep|complete|remove]` —
+  `DHCPServer.render` to standard output.
+- `dhcpctl add|complete [--keep]|remove URI <reservation>` — the operation,
+  then one line saying what was done.
+- `dhcpctl recipe URI --from DOC` — `condition_recipe` per condition.
+- `dhcpctl backends [--json]` — scheme, class and `SETTINGS` of each backend.
+
+`<reservation>` is `-n NAME [-m MAC] [--ip IP] [--hostname H] [--network CIDR]
+[--subnet-id N] [--scope-id S] [-o name=value]...` (a comma in a value makes a
+list, `json:` a JSON value), or `--from DOC` alone (`.json`/`.yaml`/`.toml`/
+`.ini` by suffix, `-` for JSON on standard input; conditions and completion
+only this way). `--owner` (default `dhcpctl`) is the connection's owner.
+Secrets are read from `DHCPCTL_USER`, `DHCPCTL_PASSWORD`, `DHCPCTL_KEYNAME`,
+`DHCPCTL_OMAPI_KEY`, never from a flag. Exit: 0 done, 1 a `DHCPCTL` error or
+`OSError` (the server refused or is unreachable), 2 a `ConfigError` or a
+usage error.
+
+## Environment variables
+
+| Variable | Read by | Effect |
+| --- | --- | --- |
+| `DHCPCTL_USER`, `DHCPCTL_PASSWORD`, `DHCPCTL_KEYNAME`, `DHCPCTL_OMAPI_KEY` | the `dhcpctl` command | that secret for the server; the library reads none |
+| `DHCPCTL_REQUIRE_PEERS` | the test suite | a real-peer test that cannot run fails instead of skipping |
 
 ## Logging
 

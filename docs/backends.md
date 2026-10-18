@@ -14,7 +14,7 @@ the fields.
 | `dnsmasq://` | dnsmasq | writes `--dhcp-hostsfile` / `--dhcp-optsfile` entries, local or over `sftp://` | nothing locally; `pydhcpctl[ssh]` for remote paths |
 | `kea://`, `keas://` | ISC Kea | `reservation-add` / `reservation-del` via the control agent | `pydhcpctl[kea]` |
 | `dhcpd://` | ISC dhcpd | an OMAPI host object | `pydhcpctl[dhcpd]` |
-| `windhcp://` | Windows DHCP | its PowerShell cmdlets *or* `netsh`, locally, over ssh or WinRM | nothing locally or over ssh; `pydhcpctl[winrm]` for WinRM |
+| `windhcp://` | Windows DHCP | its PowerShell cmdlets *or* `netsh`, locally, over ssh or WinRM | nothing locally; `pydhcpctl[ssh]` over ssh, `pydhcpctl[winrm]` for WinRM |
 
 ## What is easy to get wrong
 
@@ -26,8 +26,9 @@ the fields.
   needs); a plain file needs `reload=` every time. Options need `optsfile=`.
 - **Kea** needs the `host_cmds` hook loaded *and* a writable hosts backend; a
   file-only Kea loads the hook and still refuses.
-- **dhcpd** hosts added over OMAPI do not survive a restart by themselves —
-  that is dhcpd's design.
+- **dhcpd** writes a host added over OMAPI to its leases file, which is what
+  keeps it across a restart: a dhcpd started with a fresh leases file has lost
+  it.
 - **Windows** validates some option values as it stores them: a name server
   that does not answer is refused. It needs an account with DHCP-administrator
   rights and, for `method=powershell`, the `DhcpServer` module where the shell
@@ -48,7 +49,7 @@ script.
 | --- | --- | --- | --- |
 | `windhcp://` | a scope policy per client and condition (plus the class it references), and a base policy for the client; or, with `conditions=shared`, one policy per condition | yes, through the cmdlets — netsh has none | `ConditionMissingError` with the PowerShell to run once |
 | `dhcpd://` | an inline `if` on the host, or a named group with `conditions=group` | yes | the recipe is a durable `dhcpd.conf` group |
-| `kea://` | a client class named in the reservation | with the `class_cmds` hook | `ConditionMissingError` with the `client-classes` JSON |
+| `kea://` | a client class of the client's own, plus one serving what it overrides when it does not match | with the `class_cmds` hook | `ConditionMissingError` with the `client-classes` JSON |
 | `dnsmasq://` | — | no: the tag needs a `dhcp-match` line in dnsmasq's own config | `ConditionUnsupportedError` with the lines to add |
 
 ## Extra fragments

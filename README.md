@@ -54,10 +54,10 @@ The distribution is `pydhcpctl`; the import package is `dhcpctl`.
 | `dnsmasq://` | dnsmasq | nothing locally; `pydhcpctl[ssh]` for `sftp://` paths |
 | `kea://`, `keas://` | ISC Kea control agent | `pydhcpctl[kea]` (requests) |
 | `dhcpd://` | ISC dhcpd over OMAPI | `pydhcpctl[dhcpd]` (pypureomapi) |
-| `windhcp://` | Windows DHCP | nothing locally or over ssh; `pydhcpctl[winrm]` (pywinrm) |
+| `windhcp://` | Windows DHCP | nothing locally; `pydhcpctl[ssh]` over ssh, `pydhcpctl[winrm]` over WinRM |
 
 `pydhcpctl[formats]` adds YAML, TOML and INI to `Reservation.to_text` /
-`from_text` (JSON needs nothing).
+`from_text` (JSON needs nothing), and `pydhcpctl[cli]` the `dhcpctl` command.
 
 Python 3.9 or later.
 
@@ -106,6 +106,31 @@ server = dhcpctl.connect(
     "windhcp://dhcp01/?transport=winrm", secrets={"user": "svc", "password": "..."}
 )
 ```
+
+## Command line
+
+`pip install pydhcpctl[cli]` adds the `dhcpctl` command (also `python -m
+dhcpctl`). A reservation is given by flags, or as a document with `--from`
+(`.json`, `.yaml`, `.toml`, `.ini`, or `-` for JSON on standard input), which
+can also carry conditions and a completion:
+
+```bash
+# What arming web01 would send, contacting nothing:
+dhcpctl render 'dhcpd://dhcp01/' -n web01 -m aa:bb:cc:dd:ee:ff --ip 10.0.0.10 \
+    -o router=10.0.0.1 -o file=undionly.kpxe
+dhcpctl add 'kea://kea01/?target=memory' --from web01.json   # arm (or re-arm)
+dhcpctl complete 'kea://kea01/?target=memory' --from web01.json --keep
+dhcpctl remove 'windhcp://dhcp01/?transport=winrm' -n web01 -m aa:bb:cc:dd:ee:ff
+dhcpctl recipe 'windhcp://dhcp01/' --from web01.json         # what an admin sets up once
+dhcpctl backends --json
+```
+
+`-o name=value` is an option or header field; a comma makes a list
+(`dns=10.0.0.53,10.0.0.54`) and `json:` a JSON value (`lease-time=json:600`).
+Secrets come from the environment, never a flag: `DHCPCTL_USER`,
+`DHCPCTL_PASSWORD`, `DHCPCTL_KEYNAME`, `DHCPCTL_OMAPI_KEY`. Exit status 0 is
+done, 1 the server refused or could not be reached, 2 the invocation or the
+reservation was wrong.
 
 ## Writing a backend
 
