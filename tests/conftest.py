@@ -25,7 +25,7 @@ MAC = "aa:bb:cc:dd:ee:ff"
 IPXE = {
     "ipxe": {
         "match": {"user-class": "iPXE"},
-        "options": {"boot-file-name": "boot.ipxe"},
+        "options": {"file": "boot.ipxe"},
     }
 }
 
@@ -45,10 +45,12 @@ def isolate_registry():
 def reservation():
     """Build a `Reservation` for `web01` (10.0.0.10, aa:bb:cc:dd:ee:ff) in 10.0.0.0/24.
 
-    `server` layers the options as a caller would: `defaults` (what a scope
-    implies, say a router), then the server URI's own options, then `options`.
-    Without a server the two mappings are merged in that order. `mac=None` and
-    `ip=None` build a client without one.
+    The lease is layered as a caller would: `defaults` (what a scope implies,
+    say a router), then `options`, later winning; `options` may hold header
+    fields (`file`, `next-server`), and `next_server` sets `siaddr`. Names,
+    here and in `conditions` and `completion`, are read with the server's
+    codemap (`server.codes`), or pydhcp's without one.
+    `mac=None` and `ip=None` build a client without one.
     """
 
     def build(
@@ -56,6 +58,7 @@ def reservation():
         options: Optional[Mapping[str, Any]] = None,
         *,
         defaults: Optional[Mapping[str, Any]] = None,
+        next_server: Optional[str] = None,
         name: str = "web01",
         mac: Optional[str] = MAC,
         ip: Optional[str] = "10.0.0.10",
@@ -69,21 +72,23 @@ def reservation():
         extras: Optional[Mapping[str, Any]] = None,
         context: Any = None,
     ) -> dhcpctl.Reservation:
-        if server is not None:
-            merged = server.client_options(options or {}, defaults=defaults)
-        else:
-            merged = dhcpctl.DHCPOptions(defaults or {})
-            merged.update(options or {})
+        codes = server.codes if server is not None else dhcpctl.PYDHCP_CODES
+        lease = codes.lease(options)
+        lease = lease.replace(
+            ip=ip or "0.0.0.0",
+            options=codes.options(defaults).copy(lease.options),
+            siaddr=next_server or lease.siaddr,
+            strict=False,
+        )
         if isinstance(conditions, dict) and not all(
             isinstance(c, dhcpctl.Condition) for c in conditions.values()
         ):
-            conditions = dhcpctl.parse_conditions(conditions, "test")
+            conditions = dhcpctl.parse_conditions(conditions, "test", codes)
         if isinstance(completion, dict):
-            completion = dhcpctl.parse_completion(completion, "test")
+            completion = dhcpctl.parse_completion(completion, "test", codes)
         target = dhcpctl.Target(
             name,
             mac=MACAddress(mac) if mac is not None else None,
-            ip=ipaddress.ip_address(ip) if ip is not None else None,
             hostname=hostname,
         )
         scope = dhcpctl.Scope(
@@ -95,7 +100,7 @@ def reservation():
         return dhcpctl.Reservation(
             target,
             scope,
-            merged,
+            lease,
             conditions=conditions or {},
             completion=completion or dhcpctl.Completion(),
             extras=extras or {},

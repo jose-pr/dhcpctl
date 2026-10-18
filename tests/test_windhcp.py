@@ -13,6 +13,7 @@ import pytest
 
 import dhcpctl
 from dhcpctl.backends import WinDHCPBackend
+from dhcpctl.backends._windhcp import POWERSHELL_ARGV
 
 #: What the scope implies for every client in it.
 LAN = {"router": "10.0.0.1"}
@@ -54,7 +55,7 @@ def _payload(script: str) -> dict:
 
 
 class _Completed:
-    def __init__(self, returncode=0, stdout="{}", stderr=""):
+    def __init__(self, returncode=0, stdout='{"ok": true}', stderr=""):
         self.returncode = returncode
         self.stdout = stdout
         self.stderr = stderr
@@ -65,14 +66,15 @@ def test_connect_picks_the_windhcp_backend():
 
 
 def test_add_builds_the_reservation_and_its_options(stub, lan):
-    server, ran = stub("windhcp://admin@dhcp01/?domain-name-servers=10.0.0.53")
+    server, ran = stub()
     server.add(
         lan(
             server,
             {
-                "boot-file-name": "boot\\x64\\wdsnbp.com",
-                "tftp-server-name": "10.0.0.2",
+                "bootfile-name": "boot\\x64\\wdsnbp.com",
+                "tftp-server": "10.0.0.2",
             },
+            defaults={**LAN, "dns": "10.0.0.53"},
         )
     )
 
@@ -167,13 +169,7 @@ def test_ssh_is_the_default_transport_and_builds_its_argv(monkeypatch, lan):
     monkeypatch.setattr("dhcpctl.backends._windhcp._subprocess.run", fake_run)
     server.add(lan())
     assert recorded["argv"][:4] == ["ssh", "-p", "2222", "admin@dhcp01"]
-    assert recorded["argv"][4:] == [
-        "powershell",
-        "-NoProfile",
-        "-NonInteractive",
-        "-Command",
-        "-",
-    ]
+    assert recorded["argv"][4:] == list(POWERSHELL_ARGV)
     assert "Add-DhcpServerv4Reservation" in recorded["input"]
 
 
@@ -189,9 +185,10 @@ def test_the_user_secret_fills_in_for_a_uri_without_one(monkeypatch, lan):
     assert argvs[0][:4] == ["ssh", "-p", "22", "svc-dhcp@dhcp01"]
 
 
-def test_the_uri_user_outranks_the_secret():
+def test_the_secret_user_overrides_the_uris():
     server = dhcpctl.connect("windhcp://admin@dhcp01/", secrets={"user": "svc"})
-    assert server.user == "admin"
+    assert server.user == "svc"
+    assert dhcpctl.connect("windhcp://admin@dhcp01/").user == "admin"
 
 
 def test_a_failing_ssh_run_raises_with_the_error(monkeypatch, lan):
@@ -214,7 +211,9 @@ def winrm(monkeypatch):
     """A fake `winrm` module recording each session and script."""
     module = types.ModuleType("winrm")
     module.sessions = []
-    module.result = types.SimpleNamespace(status_code=0, std_out=b"{}", std_err=b"")
+    module.result = types.SimpleNamespace(
+        status_code=0, std_out=b'{"ok": true}', std_err=b""
+    )
 
     class Session:
         def __init__(self, endpoint, auth=None, transport=None):
@@ -312,7 +311,9 @@ def test_an_unknown_method_is_refused():
 @pytest.mark.parametrize("owner", ["dhcpctl", "netboot"])
 def test_netsh_adds_the_reservation_then_its_options(stub, lan, owner):
     server, ran = stub("windhcp://admin@dhcp01/?method=netsh", owner=owner)
-    server.add(lan(options={"boot-file-name": "pxelinux.0", "lease-time": 600}))
+    server.add(
+        lan(options={"bootfile-name": "pxelinux.0", "ip-address-lease-time": 600})
+    )
     commands = _commands(ran[0])
     # The reservation first -- an option on a reservation that does not exist
     # yet is an error, so order is part of the contract.
@@ -356,11 +357,23 @@ def test_netsh_passes_an_unknown_option_as_a_string(stub, lan):
     assert wpad[-2:] == ["STRING", "http://proxy/wpad.dat"]
 
 
+def test_netsh_is_told_a_declared_options_type_from_the_codemap(stub, lan):
+    codes = dhcpctl.option_codes({"x": {"code": 224, "type": "U32"}})
+    server, ran = stub("windhcp://dhcp01/?method=netsh", codes=codes)
+    server.add(lan(server, {"x": 4096}))
+    option = [c for c in _commands(ran[0]) if "224" in c][0]
+    assert option[-3:] == ["224", "DWORD", "4096"]
+    # The type is the codemap's: pydhcp's codemap still calls 224 opaque.
+    from dhcpctl.backends._windhcp import _netsh_type
+
+    assert _netsh_type(dhcpctl.PYDHCP_CODES.resolve(224)) == "STRING"
+
+
 def test_netsh_passes_a_multi_valued_option_as_separate_arguments(stub, reservation):
     # The cmdlets take a list, netsh takes one argument per value. Joining for
     # either would send "a,b" as a single address.
     server, ran = stub("windhcp://dhcp01/?method=netsh")
-    server.add(reservation(options={"domain-name-servers": ["10.0.0.53", "10.0.0.54"]}))
+    server.add(reservation(options={"dns": ["10.0.0.53", "10.0.0.54"]}))
     dns = [c for c in _commands(ran[0]) if "6" in c and "IPADDRESS" in c][0]
     assert dns[-2:] == ["10.0.0.53", "10.0.0.54"]
 
@@ -372,7 +385,7 @@ def test_the_cmdlets_get_a_list_of_values_not_a_joined_string(stub, lan):
     # abandons every option after it. A reservation then has a router and no
     # boot file, which is a client that gets an address and cannot boot.
     server, ran = stub("windhcp://dhcp01/")
-    server.add(lan(options={"domain-name-servers": ["10.0.0.53", "10.0.0.54"]}))
+    server.add(lan(options={"dns": ["10.0.0.53", "10.0.0.54"]}))
     options = {o["Id"]: o["Value"] for o in _payload(ran[0])["Options"]}
     assert options[6] == ["10.0.0.53", "10.0.0.54"]
     # A single-valued option is still a one-element list, so the script needs no
@@ -428,11 +441,9 @@ def test_a_hostile_value_stays_inside_the_json_payload(stub, lan):
     assert "Remove-Item C:\\ -Recurse #'" not in script.split("ConvertFrom-Json")[0]
 
 
-def test_netsh_keeps_the_raw_escape_hatch(stub, lan):
-    server, ran = stub(
-        "windhcp://dhcp01/?method=netsh&raw.windhcp=Write-Output+'extra'"
-    )
-    server.add(lan())
+def test_netsh_runs_a_powershell_line_from_extras(stub, lan):
+    server, ran = stub("windhcp://dhcp01/?method=netsh")
+    server.add(lan(extras={"add": ["Write-Output 'extra'"]}))
     assert "Write-Output 'extra'" in ran[0]
 
 
@@ -441,7 +452,7 @@ def test_netsh_asks_the_server_to_confirm_what_it_applied(stub, lan):
     # value it disliked (measured: option 6 with an unreachable name server), so
     # the payload carries what to verify and where to read it back from.
     server, ran = stub("windhcp://dhcp01/?method=netsh&server=dhcp02")
-    server.add(lan(options={"domain-name-servers": ["10.0.0.53", "10.0.0.54"]}))
+    server.add(lan(options={"dns": ["10.0.0.53", "10.0.0.54"]}))
     payload = _payload(ran[0])
     assert payload["IPAddress"] == "10.0.0.10"
     assert payload["VerifyArgs"][-1] == "dump"
@@ -461,18 +472,14 @@ def test_the_removal_script_has_nothing_to_verify(stub, lan):
 
 
 def test_windhcp_cmdlets_take_an_extra_powershell_line(stub, lan):
-    server, ran = stub(
-        "windhcp://dhcp01/?raw.windhcp=" + "Add-DhcpServerv4Policy+-Name+ipxe"
-    )
-    server.add(lan(server))
+    server, ran = stub("windhcp://dhcp01/")
+    server.add(lan(server, extras={"add": ["Add-DhcpServerv4Policy -Name ipxe"]}))
     assert "Add-DhcpServerv4Policy -Name ipxe" in ran[0]
 
 
 def test_windhcp_removal_gets_its_own_phase(stub, lan):
-    server, ran = stub(
-        "windhcp://dhcp01/?raw.windhcp.remove=" + "Remove-DhcpServerv4Policy+-Name+ipxe"
-    )
-    r = lan(server)
+    server, ran = stub("windhcp://dhcp01/")
+    r = lan(server, extras={"remove": ["Remove-DhcpServerv4Policy -Name ipxe"]})
     server.add(r)
     server.remove(r)
     assert "Remove-DhcpServerv4Policy" not in ran[0]
@@ -480,8 +487,15 @@ def test_windhcp_removal_gets_its_own_phase(stub, lan):
 
 
 def test_windhcp_keep_runs_the_remove_phase_extras(stub, lan):
-    server, ran = stub("windhcp://dhcp01/?raw.windhcp.remove=" + "Write-Output+kept")
-    server.complete(lan(server, completion={"keep": True}))
+    server, ran = stub("windhcp://dhcp01/")
+    server.complete(
+        lan(
+            server,
+            completion={"keep": True},
+            extras={"add": ["Write-Output armed"], "remove": ["Write-Output kept"]},
+        )
+    )
+    assert "Write-Output armed" not in ran[0]
     assert "Write-Output kept" in ran[0]
 
 
@@ -502,18 +516,6 @@ def test_windhcp_netsh_takes_an_extra_netsh_command(stub, lan):
     commands = _commands(ran[0])
     # Last, so the reservation it refers to already exists.
     assert commands[-1] == ["dhcp", "server", "add", "policy", "ipxe"]
-
-
-def test_a_netsh_command_from_config_is_split_on_whitespace(stub, lan):
-    # A query string has nowhere to put a list, so a raw netsh line is accepted
-    # as one string and split.
-    server, ran = stub("windhcp://dhcp01/?method=netsh")
-    server.add(lan(extras={"add": [{"Args": "dhcp server add policy ipxe"}]}))
-    command = _payload(ran[0])["Commands"][-1]
-    assert command == {
-        "Args": ["dhcp", "server", "add", "policy", "ipxe"],
-        "Ignore": False,
-    }
 
 
 def test_netsh_removal_takes_its_phase_extras(stub, lan):
@@ -612,7 +614,7 @@ def test_local_runs_the_same_script_the_other_transports_send(
     local = dhcpctl.connect("windhcp:///?server=dhcp01")
     local.add(r)
     argv, script = calls[-1]
-    assert argv[0] == "powershell" and argv[-2:] == ["-Command", "-"]
+    assert argv == list(POWERSHELL_ARGV)
     assert "-NonInteractive" in argv
 
     # Byte-identical to what ssh would have piped in.
@@ -643,3 +645,117 @@ def test_local_is_refused_where_there_is_no_powershell(monkeypatch):
     # ... and an explicit one is refused just as clearly.
     with pytest.raises(dhcpctl.ConfigError, match="needs Windows PowerShell"):
         dhcpctl.connect("windhcp://host/?transport=local")
+
+
+@pytest.mark.parametrize(
+    "option, kind",
+    [
+        ("router", "IPADDRESS"),
+        ("tftp-server-address", "IPADDRESS"),
+        ("ip-address-lease-time", "DWORD"),
+        ("interface-mtu", "WORD"),
+        ("ip-ttl", "BYTE"),
+        ("bootfile-name", "STRING"),
+        ("option-224", "STRING"),
+    ],
+)
+def test_netsh_is_told_each_option_type_from_its_pydhcp_codec(option, kind):
+    from dhcpctl.backends._windhcp import _netsh_type
+
+    assert _netsh_type(dhcpctl.PYDHCP_CODES.resolve(option)) == kind
+
+
+def test_domain_search_and_next_server_stay_off_a_windows_reservation(stub, lan):
+    from dhcpctl.backends._windhcp import _option_ids
+
+    options = dhcpctl.PYDHCP_CODES.options(
+        {"domain-search": "example.com", "router": "10.0.0.1"}
+    )
+    assert _option_ids(options) == [(3, ["10.0.0.1"])]
+    # Windows has no per-reservation next-server, so the field is not sent.
+    for uri in ("windhcp://dhcp01/", "windhcp://dhcp01/?method=netsh"):
+        server, ran = stub(uri)
+        server.add(lan(next_server="10.0.0.9"))
+        assert "10.0.0.9" not in ran[-1]
+
+
+def test_a_reservation_without_an_address_is_refused_before_any_script(stub, lan):
+    server, ran = stub()
+    with pytest.raises(dhcpctl.ConfigError, match="no ip address"):
+        server.add(lan(ip=None))
+    assert ran == []
+
+
+def test_a_netsh_command_given_as_one_string_is_refused(stub, lan):
+    # One string would reach netsh as one argument per character.
+    server, ran = stub("windhcp://dhcp01/?method=netsh")
+    with pytest.raises(dhcpctl.ConfigError, match="list of arguments"):
+        server.add(lan(extras={"add": [{"Args": "dhcp server add policy ipxe"}]}))
+    assert ran == []
+
+
+@pytest.mark.parametrize("stdout", ["", "{}", "item 1\n"])
+def test_a_script_that_does_not_reach_its_end_is_a_server_error(
+    monkeypatch, lan, stdout
+):
+    server = dhcpctl.connect("windhcp://dhcp01/")
+    monkeypatch.setattr(
+        "dhcpctl.backends._windhcp._subprocess.run",
+        lambda argv, **kwargs: _Completed(stdout=stdout),
+    )
+    with pytest.raises(dhcpctl.ServerError, match="without finishing"):
+        server.add(lan())
+
+
+def _sent_netsh(uri, reservation, action="add"):
+    server = dhcpctl.connect(uri)
+    sent = []
+    server.run = lambda payload, body: sent.append((payload, body))
+    getattr(server, action)(reservation)
+    return sent
+
+
+def test_netsh_verifies_what_it_sent_not_what_a_policy_serves(reservation):
+    r = reservation(
+        options={"router": "10.0.0.1", "file": "undionly.kpxe"},
+        conditions={
+            "ipxe": {"match": {"user-class": "iPXE"}, "options": {"file": "b"}}
+        },
+    )
+    sent = _sent_netsh("windhcp://dhcp01/?method=netsh", r)
+    payload = next(p for p, _ in sent if "Verify" in p)
+    set_ids = [
+        c["Args"][-3] for c in payload["Commands"] if "reservedoptionvalue" in c["Args"]
+    ]
+    assert [v["Id"] for v in payload["Verify"]] == set_ids
+    assert "67" not in set_ids, "option 67 is the policy's"
+
+
+def test_netsh_keep_uses_netsh(reservation):
+    r = reservation(
+        options={"router": "10.0.0.1", "file": "undionly.kpxe", "tftp-server": "t"},
+        completion={"keep": True, "options": {"file": "sanboot.ipxe"}},
+    )
+    sent = _sent_netsh("windhcp://dhcp01/?method=netsh", r, "keep")
+    ((payload, body),) = sent
+    script = "\n".join(body)
+    assert "Set-DhcpServerv4OptionValue" not in script
+    assert "Remove-DhcpServerv4OptionValue" not in script
+    commands = [c["Args"][4:] for c in payload["Commands"]]
+    assert [
+        "set",
+        "reservedoptionvalue",
+        "10.0.0.10",
+        "67",
+        "STRING",
+        "sanboot.ipxe",
+    ] in commands
+    assert ["delete", "reservedoptionvalue", "10.0.0.10", "66"] in commands
+    assert [v["Id"] for v in payload["Verify"]] == ["3", "67"]
+
+
+def test_what_a_windows_reservation_cannot_carry_is_warned_about(reservation, caplog):
+    r = reservation(options={"domain-search": ["example.com"]}, next_server="10.0.0.2")
+    with caplog.at_level("WARNING", logger="dhcpctl"):
+        _sent_netsh("windhcp://dhcp01/", r)
+    assert "option 119" in caplog.text and "next-server 10.0.0.2" in caplog.text

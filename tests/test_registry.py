@@ -12,6 +12,7 @@ import sys
 import types
 
 import pytest
+from pydhcp.options import Bytes
 
 import dhcpctl
 from dhcpctl import DHCPServer, _registry
@@ -58,6 +59,84 @@ def test_connect_picks_each_shipped_backend_by_scheme(uri, backend):
 
 def test_the_scheme_is_case_insensitive():
     assert isinstance(dhcpctl.connect("KEA://kea01/"), KeaBackend)
+
+
+# -- a URI says only how to reach the server ----------------------------------
+
+#: Each shipped backend's URI with every one of its settings, and what it reads.
+SETTINGS_ONLY = {
+    "dnsmasq": (
+        "dnsmasq:///?hostsfile=/srv/hosts.d/&optsfile=/srv/opts.d/"
+        "&reload=signal&pidfile=/run/dnsmasq.pid",
+        {
+            "hostsfile": "/srv/hosts.d/",
+            "optsfile": "/srv/opts.d/",
+            "reload": "signal",
+            "pidfile": "/run/dnsmasq.pid",
+        },
+    ),
+    "kea": ("kea://kea01/?service=dhcp4", {"service": "dhcp4"}),
+    "dhcpd": (
+        "dhcpd://dhcp01/?keyname=omapi_key&keyfile=/etc/omapi.key&conditions=group",
+        {"keyname": "omapi_key", "keyfile": "/etc/omapi.key", "conditions": "group"},
+    ),
+    "windhcp": (
+        "windhcp://admin@dhcp01/?transport=winrm&method=netsh&server=dhcp02"
+        "&auth=kerberos&port=5986&ssl=true&conditions=shared",
+        {
+            "transport": "winrm",
+            "method": "netsh",
+            "server": "dhcp02",
+            "auth": "kerberos",
+            "port": "5986",
+            "ssl": "true",
+            "conditions": "shared",
+        },
+    ),
+}
+
+#: A misspelling of one of each backend's settings.
+TYPOS = {
+    "dnsmasq": "hostfile",
+    "kea": "servce",
+    "dhcpd": "keynme",
+    "windhcp": "transprt",
+}
+
+
+@pytest.mark.parametrize("scheme", sorted(SETTINGS_ONLY))
+def test_a_uri_with_only_settings_builds(scheme):
+    uri, settings = SETTINGS_ONLY[scheme]
+    server = dhcpctl.connect(uri)
+    assert server.settings == settings
+    assert set(settings) == type(server).SETTINGS, "every setting is exercised"
+
+
+@pytest.mark.parametrize("scheme", sorted(SETTINGS_ONLY))
+@pytest.mark.parametrize(
+    "key",
+    [
+        "router",  # pydhcp's option name
+        "domain-name-servers",  # Kea's and dhcpd's own spelling of one
+        "bootfile-name",
+        "option-252",
+        "42",
+        "options_builder",
+        "next-server",
+        "raw.dhcpd",
+        "typo",
+    ],
+)
+def test_a_key_that_is_no_setting_is_refused(scheme, key):
+    uri, settings = SETTINGS_ONLY[scheme]
+    key = TYPOS[scheme] if key == "typo" else key
+    with pytest.raises(dhcpctl.ConfigError) as excinfo:
+        dhcpctl.connect(f"{uri}&{key}=10.0.0.1")
+    message = str(excinfo.value)
+    assert f"unknown key {key!r} in a {scheme} connection" in message
+    assert message.endswith("options belong to the reservation")
+    # The refusal says what the query does take.
+    assert all(setting in message for setting in settings)
 
 
 def test_importing_dhcpctl_pulls_in_no_backend_or_its_dependency():
@@ -255,33 +334,10 @@ def test_no_secrets_means_none():
     assert dhcpctl.connect("kea://kea01/").secret("password") is None
 
 
-def test_client_options_layer_defaults_then_the_uri_then_the_layers():
-    server = dhcpctl.connect("kea://kea01/?router=10.0.0.7&raw.kea=x")
-    defaults = {"router": "10.0.0.1", "domain-name": "example.com"}
-
-    options = server.client_options(defaults=defaults)
-    assert options == {"router": "10.0.0.7", "domain-name": "example.com"}
-
-    options = server.client_options(
-        {"router": "10.0.0.8", "ntp-servers": "10.0.0.123"},
-        {"router": "10.0.0.9"},
-        defaults=defaults,
-    )
-    assert options["router"] == "10.0.0.9"
-    assert options["ntp-servers"] == "10.0.0.123"
-    assert options["domain-name"] == "example.com"
-    # The URI's raw fragments are carried, and the result is what a
-    # Reservation takes.
-    assert isinstance(options, dhcpctl.DHCPOptions)
-    assert options.raw_for("kea") == ["x"]
-    # The server's own options are not changed by layering.
-    assert server.options == {"router": "10.0.0.7"}
-
-
-def test_the_options_builder_is_stored_not_called():
-    server = dhcpctl.connect("kea://kea01/?options_builder=site.dhcp:build")
-    assert server.options_builder == "site.dhcp:build"
-    assert "options_builder" not in server.client_options()
+def test_a_server_names_its_class_and_uri():
+    server = dhcpctl.connect("kea://kea01:8000/?service=dhcp4")
+    assert repr(server) == "KeaBackend('kea://kea01:8000/?service=dhcp4')"
+    assert str(server) == "kea://kea01:8000/?service=dhcp4"
 
 
 def test_extras_rejects_an_unknown_phase(reservation):
@@ -290,5 +346,58 @@ def test_extras_rejects_an_unknown_phase(reservation):
         server.extras(reservation(), "bootstrap")
 
 
-def test_a_server_names_its_class_and_uri():
-    assert repr(dhcpctl.connect("dhcpd://dhcp01/")) == "DHCPDBackend('dhcpd://dhcp01/')"
+#: A dnsmasq server that needs nothing installed and touches no file at connect.
+DNSMASQ = "dnsmasq:///?hostsfile=/srv/dnsmasq/hosts.d/"
+
+
+@pytest.mark.parametrize(
+    "make", [dict, dhcpctl.option_codes], ids=["mapping", "codemap"]
+)
+def test_connect_takes_declared_codes_for_the_servers_codemap(make):
+    codes = make({"my-option": {"code": 224, "type": "String"}})
+    for uri in ("kea://kea01/", DNSMASQ):
+        server = dhcpctl.connect(uri, codes=codes)
+        options = server.codes.options({"my-option": "y"})
+        assert dict(dhcpctl.plain_items(options)) == {224: "y"}
+        assert options.get(224) == "y", "the server's codemap decodes it as text"
+    # The type is the codemap's: pydhcp's own registry is untouched.
+    assert dhcpctl.DHCPOptionCode(224).get_type() is Bytes
+
+
+def test_without_declared_codes_the_server_cannot_read_them():
+    with pytest.raises(dhcpctl.ConfigError, match="unknown option 'my-option'"):
+        dhcpctl.connect("kea://kea01/").codes.options({"my-option": "x"})
+
+
+def test_a_kea_server_reads_keas_spelling_and_dnsmasq_refuses_it():
+    kea = dhcpctl.connect("kea://kea01/")
+    options = kea.codes.options(
+        {"domain-name-servers": "10.0.0.53", "routers": "10.0.0.1"}
+    )
+    assert dict(dhcpctl.plain_items(options)) == {6: ["10.0.0.53"], 3: ["10.0.0.1"]}
+
+    dnsmasq = dhcpctl.connect(DNSMASQ)
+    with pytest.raises(dhcpctl.ConfigError, match="unknown option 'routers'"):
+        dnsmasq.codes.options({"routers": "10.0.0.1"})
+    with pytest.raises(dhcpctl.ConfigError, match="'domain-name-servers'"):
+        dnsmasq.codes.options({"domain-name-servers": "10.0.0.53"})
+    # pydhcp's own name is every server's.
+    assert dict(dhcpctl.plain_items(dnsmasq.codes.options({"dns": "10.0.0.53"}))) == {
+        6: ["10.0.0.53"]
+    }
+
+
+def test_the_callers_codes_stack_over_the_backends():
+    server = dhcpctl.connect("kea://kea01/", codes={"routers": 42, "gw": 3})
+    # The caller's declaration wins over Kea's `routers` -> router.
+    assert int(server.codes.resolve("routers")) == 42
+    assert int(server.codes.resolve("gw")) == 3
+    # Kea's other spellings and pydhcp's names are still there underneath.
+    assert int(server.codes.resolve("tftp-server-name")) == 66
+    assert server.codes.field("boot-file-name") == "file"
+    assert int(server.codes.resolve("router")) == 3
+
+
+def test_a_bad_declaration_is_refused_at_connect():
+    with pytest.raises(dhcpctl.ConfigError, match="pydhcp's name for option 3"):
+        dhcpctl.connect("kea://kea01/", codes={"router": 6})

@@ -13,17 +13,17 @@ it: a client that silently misses its chainload boots the installer again.
 
 from __future__ import annotations
 
-from typing import Any, Dict, Mapping
+from typing import Any, Dict, Mapping, Optional, Union
 
-from ._options import DHCPOptions, is_option
+from ._options import PYDHCP_CODES, DHCPLease, DHCPOptionCode, OptionCodes, serves
 from .exceptions import ConfigError
 
 __all__ = ["MATCH_KEYS", "NAME_CHARS", "Condition", "parse_conditions"]
 
 #: `match` keys every backend can test, and the DHCP option each reads.
 MATCH_KEYS = {
-    "user-class": 77,
-    "vendor-class": 60,
+    "user-class": DHCPOptionCode.USER_CLASS,
+    "vendor-class": DHCPOptionCode.VENDOR_CLASS_IDENTIFIER,
 }
 
 #: What a condition name may contain: it becomes a PowerShell argument, a dhcpd
@@ -34,21 +34,27 @@ NAME_CHARS = frozenset(
 
 
 class Condition:
-    """One named condition: a test, and the options to serve when it matches.
+    """One named condition: a test, and what to serve when it matches.
 
     `name` is the construct's name on every backend. `match` maps a key from
     `MATCH_KEYS` to the value the client must send; several keys mean all of
-    them.
+    them. `lease` is what is served: a `DHCPLease` with no address (its
+    options, `siaddr`, `sname`, `file`), or a config mapping read with the
+    `codes` codemap (`codes.lease`).
     """
 
-    __slots__ = ("name", "match", "options")
+    __slots__ = ("name", "match", "lease")
 
     def __init__(
-        self, name: str, match: "Mapping[str, Any]", options: "Mapping[str, Any]"
+        self,
+        name: str,
+        match: "Mapping[str, Any]",
+        lease: "Union[DHCPLease, Mapping[Any, Any]]",
+        codes: "Optional[type[OptionCodes]]" = None,
     ) -> None:
         self.name = name
         self.match = dict(match)
-        self.options = DHCPOptions(options)
+        self.lease = (codes or PYDHCP_CODES).lease(lease)
 
     def __repr__(self) -> str:
         return f"Condition({self.name!r}, match={self.match!r})"
@@ -59,19 +65,30 @@ class Condition:
         return (
             self.name == other.name
             and self.match == other.match
-            and dict(self.options) == dict(other.options)
+            and self.lease == other.lease
         )
+
+    __hash__ = None  # type: ignore[assignment]
+
+    def to_mapping(self) -> Dict[str, Any]:
+        """`{match: ..., lease: ...}`, `lease` as `DHCPLease.to_mapping` writes
+        it: the entry `parse_conditions` reads back."""
+        return {"match": dict(self.match), "lease": self.lease.to_mapping()}
 
     @property
     def option_codes(self) -> Dict[int, Any]:
         """The match as `{option code: value}`, for a backend that tests by code."""
-        return {MATCH_KEYS[key]: value for key, value in self.match.items()}
+        return {int(MATCH_KEYS[key]): value for key, value in self.match.items()}
 
 
-def parse_conditions(declared: Any, where: str = "") -> Dict[str, Condition]:
-    """Build conditions from a `{name: {match: ..., options: ...}}` mapping.
+def parse_conditions(
+    declared: Any, where: str = "", codes: "Optional[type[OptionCodes]]" = None
+) -> Dict[str, Condition]:
+    """Build conditions from a `{name: {match: ..., options: ...}}` mapping, or
+    `{name: {match: ..., lease: ...}}` as `Condition.to_mapping` writes it.
 
-    `where` names the declaring object in error messages.
+    `where` names the declaring object in error messages; option names are read
+    with the `codes` codemap (pydhcp's), a config's `options` by `codes.lease`.
 
     :raises ConfigError: the mapping cannot be used as given.
     """
@@ -98,11 +115,12 @@ def parse_conditions(declared: Any, where: str = "") -> Dict[str, Condition]:
                 f"dhcp_when.{name} on {where!r} must be a mapping with `match` "
                 f"and `options`, got {type(entry).__name__}"
             )
-        unknown = set(entry) - {"match", "options"}
-        if unknown:
+        unknown = set(entry) - {"match", "options", "lease"}
+        if unknown or {"options", "lease"} <= set(entry):
+            unknown = unknown or {"options", "lease"}
             raise ConfigError(
                 f"dhcp_when.{name} on {where!r} has unknown key(s) "
-                f"{', '.join(sorted(unknown))}; it takes `match` and `options`"
+                f"{', '.join(sorted(unknown))}; it takes `match` and `options` (or `lease`)"
             )
         match = entry.get("match") or {}
         if not isinstance(match, dict) or not match:
@@ -117,16 +135,22 @@ def parse_conditions(declared: Any, where: str = "") -> Dict[str, Condition]:
                     f"every backend must be able to test it, so the accepted "
                     f"keys are {', '.join(sorted(MATCH_KEYS))}"
                 )
-        options = entry.get("options") or {}
-        if not isinstance(options, dict) or not options:
+        try:
+            if "lease" in entry:
+                lease = (codes or PYDHCP_CODES).read_lease(entry["lease"])
+            else:
+                options = entry.get("options") or {}
+                if not isinstance(options, dict):
+                    raise ConfigError(
+                        f"`options` must be a mapping, got {type(options).__name__}"
+                    )
+                lease = (codes or PYDHCP_CODES).lease(options)
+        except ConfigError as exc:
+            raise ConfigError(f"dhcp_when.{name} on {where!r}: {exc}") from exc
+        if not serves(lease):
             raise ConfigError(
                 f"dhcp_when.{name} on {where!r} needs a non-empty `options` "
                 f"mapping -- a condition that serves nothing has no effect"
             )
-        for key in options:
-            if not is_option(key):
-                raise ConfigError(
-                    f"dhcp_when.{name} on {where!r} has unknown dhcp option {key!r}"
-                )
-        conditions[name] = Condition(name, match, options)
+        conditions[name] = Condition(name, match, lease)
     return conditions

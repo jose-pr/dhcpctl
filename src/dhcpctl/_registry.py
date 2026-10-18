@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import importlib
 import logging
-from typing import Dict, Tuple, Type, Union
+from typing import Any, Dict, Tuple, Type, Union
 from urllib.parse import urlsplit
 
 from ._server import DEFAULT_OWNER, DHCPServer, Secrets
@@ -91,12 +91,18 @@ def get_backend(scheme: str) -> Type[DHCPServer]:
 
 
 def connect(
-    uri: str, *, secrets: Secrets = None, owner: str = DEFAULT_OWNER
+    uri: str,
+    *,
+    secrets: Secrets = None,
+    owner: str = DEFAULT_OWNER,
+    codes: Any = None,
 ) -> DHCPServer:
     """The backend for `uri`'s scheme, built from `uri`. Does no I/O.
 
     `secrets` supplies what the URI must not carry (see `DHCPServer.secret`);
-    `owner` names the entries this server writes (see `DHCPServer.owner`).
+    `owner` names the entries this server writes (see `DHCPServer.owner`);
+    `codes` is the codemap its option names are read with (an `OptionCodes`
+    from `option_codes`, or a mapping of declarations).
 
     :raises UnknownBackendError: no backend serves the scheme.
     :raises ConfigError: the URI cannot be used by that backend.
@@ -104,7 +110,7 @@ def connect(
     scheme = urlsplit(uri).scheme
     if not scheme:
         raise ConfigError(f"{uri!r} has no scheme, so no backend can be chosen")
-    return get_backend(scheme)(uri, secrets=secrets, owner=owner)
+    return get_backend(scheme)(uri, secrets=secrets, owner=owner, codes=codes)
 
 
 def _label(backend: Union[str, Type[DHCPServer]]) -> str:

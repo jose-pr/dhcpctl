@@ -7,22 +7,23 @@ construct -- a Windows policy, a dhcpd group or inline `if`, a Kea client class.
 """
 
 import json
-import logging
 
 import pytest
 
 import dhcpctl
-from dhcpctl import MATCH_KEYS, Condition, parse_conditions
+import ipaddress
+
+from dhcpctl import MATCH_KEYS, UNSPECIFIED, Condition, parse_conditions
 
 IPXE = {
     "ipxe": {
         "match": {"user-class": "iPXE"},
-        "options": {"boot-file-name": "boot.ipxe"},
+        "options": {"file": "boot.ipxe"},
     }
 }
 
 #: What the client is served when no condition matches.
-BASE = {"boot-file-name": "undionly.kpxe", "subnet-mask": "255.255.255.0"}
+BASE = {"file": "undionly.kpxe", "subnet-mask": "255.255.255.0"}
 
 
 @pytest.fixture
@@ -47,7 +48,44 @@ def test_a_condition_is_keyed_by_the_name_backends_will_use():
     assert conditions["ipxe"].name == "ipxe"
     assert conditions["ipxe"].match == {"user-class": "iPXE"}
     assert conditions["ipxe"].option_codes == {77: "iPXE"}
-    assert conditions["ipxe"].options == {"boot-file-name": "boot.ipxe"}
+    assert conditions["ipxe"].lease.file == "boot.ipxe"
+    assert len(conditions["ipxe"].lease.options) == 0
+    assert conditions["ipxe"].lease.siaddr == UNSPECIFIED
+
+
+def test_a_next_server_key_in_the_options_is_the_condition_next_server():
+    conditions = parse_conditions(
+        {
+            "ipxe": {
+                "match": {"user-class": "iPXE"},
+                "options": {"file": "boot.ipxe", "next-server": "10.0.0.2"},
+            }
+        },
+        "debian",
+    )
+    assert conditions["ipxe"].lease.siaddr == ipaddress.IPv4Address("10.0.0.2")
+    assert conditions["ipxe"].lease.file == "boot.ipxe"
+
+
+def test_a_condition_next_server_is_checked_where_it_is_declared():
+    with pytest.raises(dhcpctl.ConfigError, match="dhcp_when.ipxe on 'debian': siaddr"):
+        parse_conditions(
+            {
+                "ipxe": {
+                    "match": {"user-class": "iPXE"},
+                    "options": {"next-server": "tftp.example"},
+                }
+            },
+            "debian",
+        )
+
+
+def test_conditions_differing_only_in_next_server_are_not_equal():
+    a = Condition("ipxe", {"user-class": "iPXE"}, {"file": "x"})
+    b = Condition(
+        "ipxe", {"user-class": "iPXE"}, {"file": "x", "next-server": "10.0.0.2"}
+    )
+    assert a != b
 
 
 def test_nothing_declared_is_no_conditions():
@@ -56,9 +94,9 @@ def test_nothing_declared_is_no_conditions():
 
 
 def test_conditions_compare_by_content():
-    a = Condition("ipxe", {"user-class": "iPXE"}, {"boot-file-name": "x"})
-    b = Condition("ipxe", {"user-class": "iPXE"}, {"boot-file-name": "x"})
-    c = Condition("ipxe", {"user-class": "iPXE"}, {"boot-file-name": "y"})
+    a = Condition("ipxe", {"user-class": "iPXE"}, {"file": "x"})
+    b = Condition("ipxe", {"user-class": "iPXE"}, {"file": "x"})
+    c = Condition("ipxe", {"user-class": "iPXE"}, {"file": "y"})
     assert a == b and a != c
 
 
@@ -71,20 +109,20 @@ def test_a_declaration_that_is_not_a_mapping_is_refused():
     "entry, message",
     [
         ("not-a-mapping", "must be a mapping"),
-        ({"match": {}, "options": {"boot-file-name": "x"}}, "non-empty `match`"),
+        ({"match": {}, "options": {"file": "x"}}, "non-empty `match`"),
         ({"match": {"user-class": "iPXE"}}, "non-empty `options`"),
         (
-            {"match": {"hostname": "x"}, "options": {"boot-file-name": "y"}},
+            {"match": {"hostname": "x"}, "options": {"file": "y"}},
             "cannot match",
         ),
         (
             {"match": {"user-class": "x"}, "options": {"nonsense": "y"}},
-            "unknown dhcp option",
+            "unknown option",
         ),
         (
             {
                 "match": {"user-class": "x"},
-                "options": {"boot-file-name": "y"},
+                "options": {"file": "y"},
                 "zzz": 1,
             },
             "unknown key",
@@ -101,9 +139,7 @@ def test_a_malformed_condition_names_the_mistake(entry, message):
 def test_a_name_that_no_backend_could_use_is_refused():
     # The name reaches a PowerShell argument, a dhcpd identifier and a Kea class
     # name; it is kept to the intersection rather than quoted three ways.
-    declared = {
-        "bad name": {"match": {"user-class": "x"}, "options": {"boot-file-name": "y"}}
-    }
+    declared = {"bad name": {"match": {"user-class": "x"}, "options": {"file": "y"}}}
     with pytest.raises(dhcpctl.ConfigError, match="letters, digits"):
         parse_conditions(declared, "debian")
 
@@ -131,15 +167,15 @@ def test_windhcp_ensuring_one_condition_bases_only_its_own_options(reservation):
     # options *this* condition overrides; another condition's are its own.
     server, sent = _windhcp()
     r = reservation(
-        options={"boot-file-name": "undionly.kpxe", "tftp-server-name": "10.0.0.2"},
+        options={"file": "undionly.kpxe", "tftp-server": "10.0.0.2"},
         conditions={
             "ipxe": {
                 "match": {"user-class": "iPXE"},
-                "options": {"boot-file-name": "boot.ipxe"},
+                "options": {"file": "boot.ipxe"},
             },
             "uefi": {
                 "match": {"vendor-class": "PXEClient:Arch:00007"},
-                "options": {"tftp-server-name": "10.0.0.3"},
+                "options": {"tftp-server": "10.0.0.3"},
             },
         },
     )
@@ -301,7 +337,7 @@ def test_windhcp_explains_a_host_without_the_dhcpserver_module(armed, owner):
         server.add(armed())
     message = str(excinfo.value)
     assert "no DhcpServer PowerShell module" in message
-    assert "Add-DhcpServerv4Policy -Name 'ipxe'" in message
+    assert f"Add-DhcpServerv4Policy -Name '{owner}-aabbccddeeff-ipxe'" in message
     assert "Add-DhcpServerv4Class" in message
     assert excinfo.value.recipe in message
 
@@ -321,9 +357,61 @@ def test_the_windhcp_recipe_is_the_text_the_error_carries(armed, ipxe):
     server, _ = _windhcp()
     recipe = server.condition_recipe(armed(), ipxe)
     assert recipe.startswith("# dhcpctl:")
-    assert "Add-DhcpServerv4Policy -Name 'ipxe'" in recipe
-    assert "-UserClass EQ,'iPXE'" in recipe
-    assert "Set-DhcpServerv4OptionValue -PolicyName 'ipxe'" in recipe
+    # Target mode: the per-target pair that `add` itself would create.
+    assert (
+        "Add-DhcpServerv4Policy -Name 'dhcpctl-aabbccddeeff-ipxe' -ScopeId $scope "
+        "-Condition AND -UserClass EQ,'iPXE' -MacAddress EQ,'aabbccddeeff'"
+    ) in recipe
+    assert "Add-DhcpServerv4Policy -Name 'dhcpctl-aabbccddeeff' " in recipe
+    assert "-ProcessingOrder 1" in recipe and "-ProcessingOrder 2" in recipe
+    assert (
+        "Set-DhcpServerv4OptionValue -PolicyName 'dhcpctl-aabbccddeeff-ipxe'" in recipe
+    )
+
+
+def test_a_shared_windhcp_recipe_is_one_policy_by_name(armed, ipxe):
+    server, _ = _windhcp("windhcp://dhcp01/?conditions=shared")
+    recipe = server.condition_recipe(armed(), ipxe)
+    assert "Add-DhcpServerv4Policy -Name 'ipxe' -ScopeId $scope" in recipe
+    assert "-MacAddress" not in recipe and "-ProcessingOrder" not in recipe
+
+
+def test_every_value_in_a_windhcp_recipe_is_a_quoted_literal(reservation):
+    hostile = "iPXE'; Remove-DhcpServerv4Scope -ScopeId 10.0.0.0 -Force; '"
+    smart = "x\u2019; Write-Output INJECTED; \u2019"
+    condition = Condition("ipxe", {"user-class": hostile}, {"file": smart})
+    server, _ = _windhcp()
+    recipe = server.condition_recipe(reservation(), condition)
+    assert (
+        "EQ,'iPXE''; Remove-DhcpServerv4Scope -ScopeId 10.0.0.0 -Force; '''" in recipe
+    )
+    assert "'x\u2019\u2019; Write-Output INJECTED; \u2019\u2019'" in recipe
+
+
+def test_a_shared_policy_that_exists_is_left_as_it_is(armed):
+    server, sent = _windhcp("windhcp://dhcp01/?conditions=shared")
+    server.add(armed())
+    payload, body = next((p, b) for p, b in sent if "Policies" in p)
+    assert payload["Shared"] is True
+    script = "\n".join(body)
+    # Existence is checked before anything is created or set.
+    assert script.index("if ($existing -and $p.Shared) { continue }") < script.index(
+        "Add-DhcpServerv4Class"
+    )
+    assert "if (-not $cmdlets -and -not $p.Shared)" in script
+
+
+def test_removing_a_target_removes_its_own_policies(armed):
+    server, sent = _windhcp()
+    server.complete(armed())
+    names = next(p["Names"] for p, _ in sent if "Names" in p)
+    assert names == ["dhcpctl-aabbccddeeff-ipxe", "dhcpctl-aabbccddeeff"]
+
+
+def test_removing_a_shared_target_leaves_the_estates_policies(armed):
+    server, sent = _windhcp("windhcp://dhcp01/?conditions=shared")
+    server.complete(armed())
+    assert not any("Names" in p for p, _ in sent)
 
 
 # -- dhcpd: an inline `if`, or a group -------------------------------------
@@ -358,6 +446,25 @@ def test_dhcpd_inlines_the_conditional_by_default(armed):
     assert not any(call[0] == "add_group" for call in calls)
 
 
+def test_a_condition_next_server_is_a_statement_inside_its_if(armed):
+    server, calls = _dhcpd()
+    conditions = {
+        "ipxe": Condition(
+            "ipxe",
+            {"user-class": "iPXE"},
+            {"file": "boot.ipxe", "next-server": "10.0.0.3"},
+        )
+    }
+    server.add(armed(conditions=conditions, next_server="10.0.0.2"))
+    statements = calls[0][2]["statements"]
+    assert statements == (
+        'option subnet-mask 255.255.255.0; filename "undionly.kpxe"; '
+        "next-server 10.0.0.2; "
+        'if exists user-class and option user-class = "iPXE" '
+        '{ filename "boot.ipxe"; next-server 10.0.0.3; }'
+    )
+
+
 def test_dhcpd_ensure_condition_needs_nothing_created(armed, ipxe):
     server, calls = _dhcpd()
     assert server.ensure_condition(armed(), ipxe) == "ipxe"
@@ -368,11 +475,17 @@ def test_dhcpd_group_mode_creates_the_group_and_attaches_the_host(armed):
     server, calls = _dhcpd("dhcpd://dhcp01/?conditions=group")
     server.add(armed())
     names = [call[0] for call in calls]
-    assert names == ["add_group", "add_host_supersede", "change_group", "close"]
-    assert calls[0][1][0] == "ipxe"
-    assert "if exists user-class" in calls[0][1][1]
-    # The host joins after it exists: change_group takes the host's name.
-    assert calls[2][1] == ("web01", "ipxe")
+    assert names == ["group_exists", "add_group", "create_host", "close"]
+    assert calls[1][1][0] == "ipxe"
+    assert "if exists user-class" in calls[1][1][1]
+    # The host is created in its group: never a moment without its condition.
+    assert calls[2][2]["group"] == "ipxe"
+    # The host's own boot file applies only where the group's condition does not.
+    assert calls[2][2]["statements"].startswith("option subnet-mask")
+    assert (
+        'if (exists user-class and option user-class = "iPXE") { } else '
+        '{ filename "undionly.kpxe"; }'
+    ) in calls[2][2]["statements"]
 
 
 def test_dhcpd_group_mode_names_one_group_for_several_conditions(armed):
@@ -380,48 +493,50 @@ def test_dhcpd_group_mode_names_one_group_for_several_conditions(armed):
     conditions = dict(IPXE)
     conditions["winpe"] = {
         "match": {"vendor-class": "PXEClient:Arch:00000"},
-        "options": {"boot-file-name": "wdsnbp.com"},
+        "options": {"file": "wdsnbp.com"},
     }
     server.add(armed(conditions=conditions))
     # A host belongs to exactly one group, so one group carries both.
-    assert calls[0][0] == "add_group" and calls[0][1][0] == "ipxe-winpe"
-    assert calls[2][1] == ("web01", "ipxe-winpe")
+    assert calls[1][0] == "add_group" and calls[1][1][0] == "ipxe-winpe"
+    assert calls[2][2]["group"] == "ipxe-winpe"
 
 
-def test_dhcpd_group_mode_tolerates_a_group_that_is_already_there(armed, caplog):
+def test_dhcpd_group_mode_uses_a_group_that_is_already_there(armed):
     server, calls = _dhcpd("dhcpd://dhcp01/?conditions=group")
 
     class _Existing(_FakeOmapi):
-        def add_group(self, name, statements):
-            raise RuntimeError("group already exists")
+        def group_exists(self, name):
+            return True
 
     server.omapi = lambda: _Existing(calls)
-    with caplog.at_level(logging.DEBUG, logger="dhcpctl"):
-        server.add(armed())
-    assert any(call[0] == "change_group" for call in calls)
+    server.add(armed())
+    assert [call[0] for call in calls] == ["create_host", "close"]
 
 
-def test_dhcpd_group_mode_lets_another_add_group_failure_through(armed):
+def test_dhcpd_group_mode_arms_nothing_when_the_group_cannot_be_made(armed):
     server, calls = _dhcpd("dhcpd://dhcp01/?conditions=group")
 
     class _Refused(_FakeOmapi):
         def add_group(self, name, statements):
-            raise RuntimeError("permission denied")
+            raise RuntimeError("add group failed")
 
     server.omapi = lambda: _Refused(calls)
-    with pytest.raises(RuntimeError, match="permission denied"):
+    with pytest.raises(dhcpctl.ServerError, match="refused to create group 'ipxe'"):
         server.add(armed())
-    # The connection is closed whatever happened.
-    assert [call[0] for call in calls] == ["close"]
+    # No host without its condition, and the connection is closed.
+    assert [call[0] for call in calls] == ["group_exists", "close"]
 
 
 def test_dhcpd_completion_drops_the_host_out_of_its_group(armed):
     server, calls = _dhcpd("dhcpd://dhcp01/?conditions=group")
     server.complete(armed(completion={"keep": True}))
-    # Superseded without a group first, then superseded with the kept options.
-    supersedes = [call for call in calls if call[0] == "add_host_supersede"]
-    assert len(supersedes) == 2
-    assert supersedes[0][2]["statements"] is None
+    # Created again without a group, then again with the kept options.
+    names = [call[0] for call in calls if call[0] != "close"]
+    assert names == ["del_host", "create_host", "del_host", "create_host"]
+    created = [call[2] for call in calls if call[0] == "create_host"]
+    assert all(not c.get("group") for c in created)
+    assert "undionly.kpxe" in created[0]["statements"]
+    assert "undionly.kpxe" not in created[1]["statements"]
 
 
 def test_dhcpd_inline_mode_has_no_membership_to_drop(armed, ipxe):
@@ -434,7 +549,7 @@ def test_dhcpd_refuses_a_match_value_that_would_escape_its_test():
     from dhcpctl.backends._dhcpd import render_condition
 
     condition = Condition(
-        "evil", {"user-class": 'x" { filename "pwned"; } #'}, {"boot-file-name": "y"}
+        "evil", {"user-class": 'x" { filename "pwned"; } #'}, {"file": "y"}
     )
     with pytest.raises(dhcpctl.ConfigError, match="quote cannot appear"):
         render_condition(condition)
@@ -483,28 +598,54 @@ def test_kea_adds_the_class_when_it_can(armed):
     entry = dict(sent[1][1])["client-classes"][0]
     assert entry["name"] == "ipxe"
     assert entry["test"] == "option[77].text == 'iPXE'"
-    assert entry["option-data"] == [{"name": "boot-file-name", "data": "boot.ipxe"}]
+    # The boot file is the class's header field, as on a reservation.
+    assert entry["boot-file-name"] == "boot.ipxe"
+    assert "option-data" not in entry
 
 
 def test_a_kea_class_spells_reservation_fields_as_options():
-    # A class has no reservation fields: next-server becomes the tftp server
-    # option, and a numeric option keeps its code.
+    # A class has no reservation fields: hostname stays option 12 and a
+    # numeric option keeps its code. next-server is the class's own field.
     from dhcpctl.backends._kea import _class
 
     condition = Condition(
         "c",
         {"user-class": "iPXE", "vendor-class": "PXEClient"},
-        {"next-server": "10.0.0.2", "host-name": "h", "option-252": "x"},
+        {"next-server": "10.0.0.2", "hostname": "h", "option-252": "x"},
     )
     entry = _class(condition)
     assert (
         entry["test"] == "option[77].text == 'iPXE' and option[60].text == 'PXEClient'"
     )
     assert entry["option-data"] == [
-        {"name": "tftp-server-name", "data": "10.0.0.2"},
-        {"name": "host-name", "data": "h"},
+        {"code": 12, "data": "h"},
         {"code": 252, "data": "x"},
     ]
+    assert entry["next-server"] == "10.0.0.2"
+
+
+def test_a_kea_class_without_next_server_has_no_such_field():
+    from dhcpctl.backends._kea import _class
+
+    entry = _class(Condition("c", {"user-class": "iPXE"}, {"file": "x"}))
+    assert "next-server" not in entry
+
+
+def test_a_condition_next_server_reaches_the_kea_class_add(armed):
+    server, sent = _kea(class_exists=False)
+    conditions = {
+        "ipxe": Condition(
+            "ipxe",
+            {"user-class": "iPXE"},
+            {"file": "boot.ipxe", "next-server": "10.0.0.3"},
+        )
+    }
+    server.add(armed(conditions=conditions, next_server="10.0.0.2"))
+    entry = dict(sent[1][1])["client-classes"][0]
+    assert entry["next-server"] == "10.0.0.3"
+    assert entry["boot-file-name"] == "boot.ipxe"
+    # The reservation keeps its own next-server; the class's wins on a match.
+    assert dict(sent[2][1])["reservation"]["next-server"] == "10.0.0.2"
 
 
 def test_the_kea_reservation_names_its_classes(armed):
@@ -548,9 +689,7 @@ def test_kea_reports_another_class_add_failure(armed):
 def test_a_kea_test_cannot_be_escaped_by_a_match_value():
     from dhcpctl.backends._kea import _class
 
-    condition = Condition(
-        "evil", {"user-class": "x' or 'a'=='a"}, {"boot-file-name": "y"}
-    )
+    condition = Condition("evil", {"user-class": "x' or 'a'=='a"}, {"file": "y"})
     with pytest.raises(dhcpctl.ConfigError, match="quote or newline"):
         _class(condition)
 
@@ -577,7 +716,7 @@ def test_the_dnsmasq_recipe_is_the_match_and_option_pair(tmp_path, armed, ipxe):
     recipe = server.condition_recipe(armed(), ipxe)
     assert recipe.split("\n  ") == [
         "dhcp-match=set:ipxe,77,iPXE",
-        "dhcp-option=tag:ipxe,67,boot.ipxe",
+        "dhcp-option=tag:ipxe,option:bootfile-name,boot.ipxe",
     ]
 
 
@@ -588,3 +727,20 @@ def test_dnsmasq_writes_nothing_when_it_refuses(tmp_path, armed):
     with pytest.raises(dhcpctl.ConditionUnsupportedError):
         server.add(armed())
     assert list(hosts.iterdir()) == [], "a refusal must not half-apply"
+
+
+def test_the_dnsmasq_recipe_carries_a_next_server_in_dhcp_boot():
+    from dhcpctl.backends import DnsmasqBackend
+
+    server = DnsmasqBackend("dnsmasq:///?hostsfile=/tmp/h/")
+    condition = Condition(
+        "ipxe",
+        {"user-class": "iPXE"},
+        {"file": "boot.ipxe", "next-server": "10.0.0.2"},
+    )
+    recipe = server.condition_recipe(None, condition)
+    assert recipe.split("\n  ") == [
+        "dhcp-match=set:ipxe,77,iPXE",
+        "dhcp-option=tag:ipxe,option:bootfile-name,boot.ipxe",
+        "dhcp-option=tag:ipxe,option:server-ip-address,10.0.0.2",
+    ]

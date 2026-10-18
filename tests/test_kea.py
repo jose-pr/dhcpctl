@@ -71,8 +71,15 @@ def test_connect_picks_the_kea_backend_for_both_schemes():
 
 
 def test_add_posts_one_reservation_with_fields_and_options(kea_server, lan):
-    server, fake = kea_server("kea://10.0.0.1:8000/?domain-name-servers=10.0.0.53")
-    server.add(lan(server, {"boot-file-name": "pxelinux.0", "next-server": "10.0.0.2"}))
+    server, fake = kea_server()
+    server.add(
+        lan(
+            server,
+            {"boot-file-name": "pxelinux.0"},
+            defaults={"domain-name-servers": "10.0.0.53"},
+            next_server="10.0.0.2",
+        )
+    )
 
     assert len(fake.posted) == 1
     url, payload, _ = fake.posted[0]
@@ -86,45 +93,136 @@ def test_add_posts_one_reservation_with_fields_and_options(kea_server, lan):
     # Reservation fields, not option-data entries.
     assert reservation["boot-file-name"] == "pxelinux.0"
     assert reservation["next-server"] == "10.0.0.2"
-    assert {"name": "domain-name-servers", "data": "10.0.0.53"} in reservation[
-        "option-data"
-    ]
+    assert {"code": 6, "data": "10.0.0.53"} in reservation["option-data"]
     assert not any(
-        entry.get("name") in ("boot-file-name", "next-server")
-        for entry in reservation["option-data"]
+        entry.get("code") in (66, 67) for entry in reservation["option-data"]
     )
     # No classes asked for, so none named.
     assert "client-classes" not in reservation
 
 
+def test_a_reservation_without_next_server_has_no_such_field(kea_server, lan):
+    server, fake = kea_server()
+    server.add(lan(server, {"boot-file-name": "pxelinux.0"}))
+    reservation = fake.posted[0][1]["arguments"]["reservation"]
+    assert "next-server" not in reservation
+    assert "option-data" not in reservation
+
+
+def test_next_server_alone_is_a_reservation_field(kea_server, lan):
+    server, fake = kea_server()
+    server.add(lan(next_server="10.0.0.2"))
+    reservation = fake.posted[0][1]["arguments"]["reservation"]
+    assert reservation["next-server"] == "10.0.0.2"
+    assert "option-data" not in reservation
+
+
+@pytest.mark.parametrize("unset", [None, "0.0.0.0"])
+def test_an_unspecified_address_is_no_field(kea_server, lan, unset):
+    server, fake = kea_server()
+    server.add(lan(ip=unset, next_server=unset))
+    reservation = fake.posted[0][1]["arguments"]["reservation"]
+    assert "ip-address" not in reservation
+    assert "next-server" not in reservation
+    assert reservation["hw-address"] == "aa:bb:cc:dd:ee:ff"
+
+
 def test_the_host_name_option_is_the_hostname_field(kea_server, lan):
     server, fake = kea_server()
-    server.add(lan(options={"host-name": "web01.lan"}))
+    server.add(lan(server, {"host-name": "web01.lan"}))
     reservation = fake.posted[0][1]["arguments"]["reservation"]
     assert reservation["hostname"] == "web01.lan"
     assert "option-data" not in reservation
 
 
 def test_a_multi_valued_option_is_comma_joined(kea_server, lan):
-    server, fake = kea_server(
-        "kea://10.0.0.1:8000/?domain-name-servers=10.0.0.53&domain-name-servers=10.0.0.54"
-    )
-    server.add(lan(server))
+    server, fake = kea_server()
+    server.add(lan(server, {"domain-name-servers": ["10.0.0.53", "10.0.0.54"]}))
     reservation = fake.posted[0][1]["arguments"]["reservation"]
-    assert reservation["option-data"] == [
-        {"name": "domain-name-servers", "data": "10.0.0.53,10.0.0.54"}
-    ]
+    assert reservation["option-data"] == [{"code": 6, "data": "10.0.0.53,10.0.0.54"}]
 
 
 def test_the_service_setting_names_the_daemon(kea_server, lan):
-    server, fake = kea_server("kea://10.0.0.1:8000/?service=dhcp6")
+    server, fake = kea_server("kea://10.0.0.1:8000/?service=dhcp4")
     server.add(lan())
-    assert fake.posted[0][1]["service"] == ["dhcp6"]
+    assert fake.posted[0][1]["service"] == ["dhcp4"]
+
+
+@pytest.mark.parametrize("service", ["dhcp6", "d2"])
+def test_a_service_other_than_dhcp4_is_refused(service):
+    with pytest.raises(dhcpctl.ConfigError, match="dhcp4 only"):
+        dhcpctl.connect(f"kea://k/?service={service}")
+
+
+def test_keep_falls_back_to_delete_and_add_without_reservation_update(kea_server, lan):
+    server, fake = kea_server(
+        "kea://k/", {"reservation-update": {"result": 2, "text": "unsupported"}}
+    )
+    server.keep(lan(completion={"keep": True}))
+    assert fake.commands() == [
+        "reservation-update",
+        "reservation-del",
+        "reservation-add",
+    ]
+
+
+@pytest.mark.parametrize("failing", ["reservation-update", "reservation-add"])
+def test_every_step_of_a_rewrite_is_checked(kea_server, lan, failing):
+    replies = {failing: {"result": 1, "text": "duplicate entry"}}
+    if failing == "reservation-add":
+        replies["reservation-update"] = {"result": 2, "text": "unsupported"}
+    server, _ = kea_server("kea://k/", replies)
+    with pytest.raises(dhcpctl.ServerError, match="duplicate entry"):
+        server.keep(lan(completion={"keep": True}))
+
+
+def test_detaching_a_class_rewrites_the_reservation_and_checks_it(kea_server, lan):
+    server, fake = kea_server(
+        "kea://k/", {"reservation-update": {"result": 1, "text": "no such host"}}
+    )
+    condition = dhcpctl.parse_conditions(
+        {"ipxe": {"match": {"user-class": "iPXE"}, "options": {"file": "b"}}}, "t"
+    )["ipxe"]
+    with pytest.raises(dhcpctl.ServerError, match="no such host"):
+        server.remove_condition_member(lan(), condition)
+
+
+def test_keep_writes_the_remove_phase_extras(kea_server, lan):
+    server, fake = kea_server("kea://k/")
+    server.keep(
+        lan(
+            completion={"keep": True},
+            extras={
+                "add": [{"code": 250, "data": "a"}],
+                "remove": [{"code": 251, "data": "r"}],
+            },
+        )
+    )
+    entry = fake.posted[0][1]["arguments"]["reservation"]
+    codes = [item["code"] for item in entry.get("option-data", [])]
+    assert 251 in codes and 250 not in codes
+
+
+def test_a_subnet_inside_a_shared_network_is_found(kea_server, reservation):
+    config = {
+        "result": 0,
+        "arguments": {
+            "Dhcp4": {
+                "subnet4": [{"id": 1, "subnet": "192.168.0.0/24"}],
+                "shared-networks": [
+                    {"name": "lab", "subnet4": [{"id": 7, "subnet": "10.0.0.0/24"}]}
+                ],
+            }
+        },
+    }
+    server, fake = kea_server("kea://k/", {"config-get": config})
+    server.add(reservation(server))
+    assert fake.posted[-1][1]["arguments"]["reservation"]["subnet-id"] == 7
 
 
 def test_a_numeric_option_uses_its_code(kea_server, lan):
-    server, fake = kea_server("kea://10.0.0.1:8000/?option-252=http://proxy/wpad.dat")
-    server.add(lan(server))
+    server, fake = kea_server()
+    server.add(lan(server, {"option-252": "http://proxy/wpad.dat"}))
     reservation = fake.posted[0][1]["arguments"]["reservation"]
     assert {"code": 252, "data": "http://proxy/wpad.dat"} in reservation["option-data"]
 
@@ -280,7 +378,7 @@ def test_without_requests_the_extra_is_named(monkeypatch):
 # -- extras ----------------------------------------------------------------
 
 
-def test_raw_entries_are_merged_as_option_data(kea_server, lan):
+def test_extra_entries_are_merged_as_option_data(kea_server, lan):
     server, fake = kea_server()
     # A Kea fragment is an `option-data` entry, passed through untouched.
     server.add(lan(extras={"add": [{"code": 250, "data": "x"}]}))
@@ -288,8 +386,8 @@ def test_raw_entries_are_merged_as_option_data(kea_server, lan):
     assert {"code": 250, "data": "x"} in reservation["option-data"]
 
 
-def test_kea_appends_the_uri_extra_option_data(kea_server, lan):
-    server, fake = kea_server("kea://ctrl01/?raw.kea=" + "not-a-real-option")
-    server.add(lan(server))
+def test_kea_appends_an_extra_it_does_not_check(kea_server, lan):
+    server, fake = kea_server("kea://ctrl01/")
+    server.add(lan(server, extras={"add": ["not-a-real-option"]}))
     reservation = fake.posted[0][1]["arguments"]["reservation"]
     assert "not-a-real-option" in reservation["option-data"]

@@ -18,6 +18,7 @@ from urllib.parse import urlsplit
 
 from .._conditions import Condition
 from .._model import Reservation
+from .._options import DHCPLease, DHCPOptionCode, plain_items
 from .._server import DEFAULT_OWNER, DHCPServer, Secrets
 from ..exceptions import (
     BackendUnavailableError,
@@ -31,33 +32,59 @@ __all__ = ["KeaBackend"]
 
 LOGGER = logging.getLogger("dhcpctl")
 
-#: Reservation *fields* in Kea's model: they are not `option-data` entries.
-_FIELDS = {
-    "next-server": "next-server",
-    "boot-file-name": "boot-file-name",
-    "host-name": "hostname",
-}
+#: Options that are reservation *fields* in Kea's model, not `option-data`.
+_FIELDS = {DHCPOptionCode.HOSTNAME: "hostname"}
+
+#: The lease's BOOTP header fields, by Kea's names for them (a reservation and
+#: a client class take all three).
+_BOOT_FIELDS = (
+    ("siaddr", "next-server"),
+    ("sname", "server-hostname"),
+    ("file", "boot-file-name"),
+)
 
 
 class KeaBackend(DHCPServer):
     """`kea://[user@]host:8000/?service=dhcp4` (`keas://` for https).
 
-    Client options ride in the query; `subnet_id` does not -- it belongs to the
-    scope, because one Kea serves many subnets. The account is the `user` and
+    The subnet id belongs to the reservation's scope, because one Kea serves
+    many subnets. The account is the `user` and
     `password` secrets: the URI's, else the caller's.
     """
 
     SETTINGS = frozenset({"service"})
+    #: Kea's names for the options and header fields its users name most; Kea
+    #: is sent codes.
+    OPTION_NAMES = {
+        "routers": "router",
+        "domain-name-servers": "dns",
+        "boot-file-name": "file",
+        "server-hostname": "sname",
+        "tftp-server-name": "tftp-server",
+        "host-name": "hostname",
+        "dhcp-lease-time": "ip-address-lease-time",
+    }
 
     def __init__(
-        self, uri: str, *, secrets: Secrets = None, owner: str = DEFAULT_OWNER
+        self,
+        uri: str,
+        *,
+        secrets: Secrets = None,
+        owner: str = DEFAULT_OWNER,
+        codes: Any = None,
     ) -> None:
-        super().__init__(uri, secrets=secrets, owner=owner)
+        super().__init__(uri, secrets=secrets, owner=owner, codes=codes)
         parts = urlsplit(uri)
         scheme = "https" if parts.scheme.lower() == "keas" else "http"
         port = parts.port or 8000
         self.endpoint = f"{scheme}://{parts.hostname or 'localhost'}:{port}/"
         self.service = self.settings.get("service", "dhcp4")
+        if self.service != "dhcp4":
+            # A reservation here is DHCPv4: subnet4, hw-address, option codes.
+            raise ConfigError(
+                f"kea: service={self.service!r} is not supported; reservations are "
+                f"made for dhcp4 only"
+            )
         self._subnet_ids: Dict[str, int] = {}
 
     @property
@@ -136,37 +163,42 @@ class KeaBackend(DHCPServer):
         raise ServerError(_explain(command="reservation-del", result=result))
 
     def keep(self, reservation: Reservation) -> None:
-        """Rewrite the reservation with the completion options.
-
-        Kea has no partial reservation update, so this is `reservation-add`,
-        which upserts: a failure leaves the old reservation in place rather than
-        none at all.
-        """
-        entry = self._reservation(reservation)
-        entry.pop("client-classes", None)
-        for field in ("boot-file-name", "next-server"):
-            entry.pop(field, None)
-        option_data = [
-            item
-            for item in entry.get("option-data", [])
-            if item.get("name") not in ("boot-file-name", "tftp-server-name")
-        ]
-        for name, value in reservation.completion.options.items():
-            field = _FIELDS.get(name)
-            if field:
-                entry[field] = _value(value)
-            else:
-                option_data.append({"name": name, "data": _value(value)})
-        if option_data:
-            entry["option-data"] = option_data
-        else:
-            entry.pop("option-data", None)
-        result = self.command(
-            "reservation-add",
-            {"reservation": entry, "subnet-id": entry.get("subnet-id")},
+        """Rewrite the reservation with the completion's lease applied, and the
+        `remove`-phase extras, as every backend's keep does."""
+        entry = self._reservation(
+            reservation,
+            reservation.completion.apply_to(reservation.lease),
+            phase="remove",
         )
-        if result.get("result") != 0:
-            raise ServerError(_explain(command="reservation-add", result=result))
+        entry.pop("client-classes", None)
+        self._replace(entry)
+
+    def _replace(self, entry: Dict[str, Any]) -> None:
+        """Write `entry` over the reservation Kea already holds for its MAC.
+
+        `reservation-add` refuses an existing reservation, so this is
+        `reservation-update`; a Kea without that command (result 2) gets the
+        reservation deleted and added again. Every result is checked.
+        """
+        updated = self.command("reservation-update", {"reservation": entry})
+        code = updated.get("result")
+        if code == 0:
+            return
+        if code != 2:
+            raise ServerError(_explain(command="reservation-update", result=updated))
+        deleted = self.command(
+            "reservation-del",
+            {
+                "subnet-id": entry["subnet-id"],
+                "identifier-type": "hw-address",
+                "identifier": entry["hw-address"],
+            },
+        )
+        if deleted.get("result") not in (0, 3):
+            raise ServerError(_explain(command="reservation-del", result=deleted))
+        added = self.command("reservation-add", {"reservation": entry})
+        if added.get("result") != 0:
+            raise ServerError(_explain(command="reservation-add", result=added))
 
     # -- conditions (client classes) ---------------------------------------
 
@@ -207,36 +239,37 @@ class KeaBackend(DHCPServer):
         """Rewrite the reservation without its classes, keeping the class itself."""
         entry = self._reservation(reservation)
         entry.pop("client-classes", None)
-        self.command(
-            "reservation-add",
-            {"reservation": entry, "subnet-id": entry.get("subnet-id")},
-        )
+        self._replace(entry)
 
     # -- building the reservation -----------------------------------------
 
-    def _reservation(self, reservation: Reservation) -> Dict[str, Any]:
-        target = reservation.target
-        mac = target.require_mac("a Kea reservation is identified by one")
+    def _reservation(
+        self,
+        reservation: Reservation,
+        lease: "Optional[DHCPLease]" = None,
+        phase: str = "add",
+    ) -> Dict[str, Any]:
+        """The reservation entry serving `lease` (the reservation's own), with
+        `phase`'s extras."""
+        lease = lease or reservation.lease
+        mac = reservation.target.require_mac("a Kea reservation is identified by one")
 
         entry: Dict[str, Any] = {
             "subnet-id": self._subnet_id(reservation),
             "hw-address": str(mac),
         }
-        if target.ip:
-            entry["ip-address"] = target.ip_text
+        if reservation.ip_text:
+            entry["ip-address"] = reservation.ip_text
 
         option_data: List[Any] = []
-        for name, value in reservation.options.items():
-            field = _FIELDS.get(name)
+        for key, value in plain_items(lease.options):
+            field = _FIELDS.get(key)
             if field:
                 entry[field] = _value(value)
-                continue
-            if name.startswith("option-") or name.isdigit():
-                code = name[len("option-") :] if name.startswith("option-") else name
-                option_data.append({"code": int(code), "data": _value(value)})
             else:
-                option_data.append({"name": name, "data": _value(value)})
-        option_data.extend(self.extras(reservation, "add"))
+                option_data.append(_option_data(key, value))
+        entry.update(_boot_fields(lease))
+        option_data.extend(self.extras(reservation, phase))
         if option_data:
             entry["option-data"] = option_data
         if reservation.conditions:
@@ -259,8 +292,11 @@ class KeaBackend(DHCPServer):
 
         network = scope.network
         if network is not None:
-            config = self.command("config-get").get("arguments", {})
-            subnets = config.get(f"Dhcp{self.service[-1]}", {}).get("subnet4", [])
+            config = self.command("config-get").get("arguments", {}).get("Dhcp4", {})
+            # A subnet is at the top level or inside a shared network.
+            subnets = list(config.get("subnet4", []))
+            for shared in config.get("shared-networks", []):
+                subnets.extend(shared.get("subnet4", []))
             for subnet in subnets:
                 if str(subnet.get("subnet", "")) == str(network):
                     found = int(subnet["id"])
@@ -285,29 +321,28 @@ def _class(condition: Condition) -> Dict[str, Any]:
         "name": condition.name,
         "test": " and ".join(tests),
     }
-    option_data = []
-    for name, value in condition.options.items():
-        if name in _FIELDS:
-            # Reservation fields are not options; a class has to use the option
-            # spelling instead.
-            option_data.append({"name": _CLASS_OPTIONS[name], "data": _value(value)})
-            continue
-        if name.startswith("option-") or name.isdigit():
-            code = name[len("option-") :] if name.startswith("option-") else name
-            option_data.append({"code": int(code), "data": _value(value)})
-        else:
-            option_data.append({"name": name, "data": _value(value)})
+    option_data = [
+        _option_data(key, value) for key, value in plain_items(condition.lease.options)
+    ]
     if option_data:
         entry["option-data"] = option_data
+    entry.update(_boot_fields(condition.lease))
     return entry
 
 
-#: A reservation field's option-name equivalent, for a class.
-_CLASS_OPTIONS = {
-    "boot-file-name": "boot-file-name",
-    "next-server": "tftp-server-name",
-    "host-name": "host-name",
-}
+def _boot_fields(lease: DHCPLease) -> Dict[str, str]:
+    """The lease's header fields that are set, by Kea's names."""
+    fields = {}
+    for attribute, name in _BOOT_FIELDS:
+        value = getattr(lease, attribute)
+        if value and not (attribute == "siaddr" and value.is_unspecified):
+            fields[name] = str(value)
+    return fields
+
+
+def _option_data(key: Any, value: Any) -> Dict[str, Any]:
+    """One `option-data` entry. By code: Kea's names are not pydhcp's."""
+    return {"code": int(key), "data": _value(value)}
 
 
 def _escape_test(value: Any) -> str:

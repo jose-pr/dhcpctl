@@ -1,4 +1,4 @@
-"""Secrets: the URI's user and password if it carries them, else the caller's.
+"""Secrets: the caller's, else the URI's user and password.
 
 Whatever the source, a password never appears in `str`, `repr` or a message.
 """
@@ -12,7 +12,7 @@ import dhcpctl
 
 
 class _Recorder(dhcpctl.DHCPServer):
-    pass
+    SETTINGS = frozenset({"region"})
 
 
 @pytest.fixture
@@ -27,12 +27,20 @@ def test_the_uri_supplies_user_and_password(recorder):
     assert server.secret("password") == "s3cret"
 
 
-def test_the_uri_outranks_the_caller(recorder):
+def test_the_caller_overrides_the_uri(recorder):
     server = recorder(
         "rec://admin:s3cret@host/", secrets={"user": "other", "password": "vault"}
     )
+    assert server.secret("user") == "other"
+    assert server.secret("password") == "vault"
+
+
+def test_a_caller_none_keeps_the_uris_and_empty_is_empty(recorder):
+    server = recorder(
+        "rec://admin:s3cret@host/", secrets={"user": None, "password": ""}
+    )
     assert server.secret("user") == "admin"
-    assert server.secret("password") == "s3cret"
+    assert server.secret("password") == ""
 
 
 def test_the_caller_fills_in_what_the_uri_lacks(recorder):
@@ -46,7 +54,7 @@ def test_the_caller_fills_in_what_the_uri_lacks(recorder):
     assert asked == [], "nothing is asked for at construction"
     assert server.secret("user") == "admin"
     assert server.secret("password") == "vault"
-    assert asked == ["password"]
+    assert asked == ["user", "password"]
 
 
 def test_a_percent_encoded_password_is_decoded(recorder):
@@ -57,7 +65,10 @@ def test_a_percent_encoded_password_is_decoded(recorder):
 @pytest.mark.parametrize(
     "uri, shown",
     [
-        ("rec://admin:s3cret@host:99/?router=1", "rec://admin:***@host:99/?router=1"),
+        (
+            "rec://admin:s3cret@host:99/?region=eu",
+            "rec://admin:***@host:99/?region=eu",
+        ),
         ("rec://admin@host/", "rec://admin@host/"),
         ("rec://host/", "rec://host/"),
         ("rec://:s3cret@host/", "rec://:***@host/"),
@@ -99,7 +110,9 @@ def winrm(monkeypatch):
             module.sessions.append(self)
 
         def run_ps(self, script):
-            return types.SimpleNamespace(status_code=0, std_out=b"{}", std_err=b"")
+            return types.SimpleNamespace(
+                status_code=0, std_out=b'{"ok": true}', std_err=b""
+            )
 
     module.Session = Session
     monkeypatch.setitem(sys.modules, "winrm", module)
@@ -107,13 +120,19 @@ def winrm(monkeypatch):
 
 
 def test_windhcp_takes_the_winrm_password_from_the_uri(winrm, reservation):
+    server = dhcpctl.connect("windhcp://admin:s3cret@dhcp01/?transport=winrm")
+    server.remove(reservation())
+    assert winrm.sessions[0].auth == ("admin", "s3cret")
+    assert "s3cret" not in repr(server)
+
+
+def test_a_callers_winrm_password_overrides_the_uris(winrm, reservation):
     server = dhcpctl.connect(
         "windhcp://admin:s3cret@dhcp01/?transport=winrm",
         secrets={"password": "vault"},
     )
     server.remove(reservation())
-    assert winrm.sessions[0].auth == ("admin", "s3cret")
-    assert "s3cret" not in repr(server)
+    assert winrm.sessions[0].auth == ("admin", "vault")
 
 
 @pytest.fixture

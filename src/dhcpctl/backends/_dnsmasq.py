@@ -2,9 +2,10 @@
 
 dnsmasq re-reads the files given to `--dhcp-hostsfile` / `--dhcp-optsfile` on
 SIGHUP, but **not** its main config file. `--dhcp-hostsdir` / `--dhcp-optsdir`
-take a directory and pick up changed or new files with no signal at all, which
-is why directory mode is the recommended shape: write a file and be done, with
-no shell access and no right to signal anything.
+take a directory and read a new or changed file with no signal, but only ever
+**add** what they read: a deleted or rewritten file keeps being served until
+SIGHUP (dnsmasq(8)). So directory mode arms a new client with no signal, and
+signals whenever it takes an entry away.
 
 Paths go through pathapi, so the same code serves a dnsmasq on this host and one
 reached over `sftp://`.
@@ -12,6 +13,7 @@ reached over `sftp://`.
 
 from __future__ import annotations
 
+import hashlib as _hashlib
 import logging
 import os as _os
 import shlex as _shlex
@@ -21,7 +23,7 @@ from urllib.parse import urlsplit
 
 from .._conditions import MATCH_KEYS, Condition
 from .._model import Reservation, Target
-from .._options import DHCPOptions
+from .._options import DHCPLease, DHCPOptions, plain_items
 from .._paths import parse_path
 from .._server import DEFAULT_OWNER, DHCPServer, Secrets
 from ..exceptions import (
@@ -34,21 +36,6 @@ from ..exceptions import (
 __all__ = ["DnsmasqBackend"]
 
 LOGGER = logging.getLogger("dhcpctl")
-
-#: Generic option name -> dnsmasq option number.
-_CODES = {
-    "router": 3,
-    "subnet-mask": 1,
-    "broadcast-address": 28,
-    "domain-name-servers": 6,
-    "domain-name": 15,
-    "domain-search": 119,
-    "ntp-servers": 42,
-    "lease-time": 51,
-    "tftp-server-name": 66,
-    "boot-file-name": 67,
-    "vendor-class-identifier": 60,
-}
 
 
 class DnsmasqBackend(DHCPServer):
@@ -63,9 +50,14 @@ class DnsmasqBackend(DHCPServer):
     SETTINGS = frozenset({"hostsfile", "optsfile", "reload", "pidfile"})
 
     def __init__(
-        self, uri: str, *, secrets: Secrets = None, owner: str = DEFAULT_OWNER
+        self,
+        uri: str,
+        *,
+        secrets: Secrets = None,
+        owner: str = DEFAULT_OWNER,
+        codes: Any = None,
     ) -> None:
-        super().__init__(uri, secrets=secrets, owner=owner)
+        super().__init__(uri, secrets=secrets, owner=owner, codes=codes)
         parts = urlsplit(uri)
         self.host = parts.hostname or ""
         self.user = parts.username or ""
@@ -79,6 +71,11 @@ class DnsmasqBackend(DHCPServer):
         self.hostsfile = self._path(hostsfile)
         optsfile = self.settings.get("optsfile")
         self.optsfile = self._path(optsfile) if optsfile else None
+        # Read from the setting as written: a path type may drop the slash.
+        self._slashed = {
+            "hosts": hostsfile.endswith(("/", "\\")),
+            "opts": bool(optsfile) and optsfile.endswith(("/", "\\")),
+        }
         self.reload_command = self.settings.get("reload")
         self.pidfile = self.settings.get("pidfile", "/run/dnsmasq/dnsmasq.pid")
         self._reload_warned = False
@@ -108,19 +105,19 @@ class DnsmasqBackend(DHCPServer):
             f"dnsmasq cannot serve dhcp_when.{condition.name}: the tag needs a "
             f"`dhcp-match` line in dnsmasq's own config, which {self.owner} does "
             f"not write (--dhcp-optsfile takes dhcp-option lines only). Put this "
-            f"in dnsmasq.conf and use `raw.dnsmasq=` for the option half:\n"
+            f"in dnsmasq.conf, and the option half in the reservation's extras:\n"
             f"  {self.condition_recipe(reservation, condition)}"
         )
 
     def condition_recipe(self, reservation: Reservation, condition: Condition) -> str:
         """The `dhcp-match`/`dhcp-option` pair for dnsmasq.conf."""
         lines = [
-            f"dhcp-match=set:{condition.name},{MATCH_KEYS[key]},{value}"
+            f"dhcp-match=set:{condition.name},{int(MATCH_KEYS[key])},{value}"
             for key, value in condition.match.items()
         ]
         lines.extend(
-            f"dhcp-option=tag:{condition.name},{code},{_value(value)}"
-            for code, value in _codes(condition.options)
+            f"dhcp-option={value}"
+            for value in _option_lines(condition.name, condition.lease)
         )
         return "\n  ".join(lines)
 
@@ -129,66 +126,93 @@ class DnsmasqBackend(DHCPServer):
         # that boots the installer again.
         for condition in reservation.conditions.values():
             self.ensure_condition(reservation, condition)
-        target = reservation.target
-        tag = self._tag(target)
-        self._write(self.hostsfile, tag, [_host_line(target, tag)])
+        tag = self._tag(reservation.target)
+        options = _option_lines(tag, reservation.lease, self.extras(reservation, "add"))
+        self._require_optsfile(options)
+        took = self._write("hosts", tag, [_host_line(reservation, tag)])
         if self.optsfile is not None:
-            self._write(
-                self.optsfile,
-                tag,
-                _option_lines(
-                    tag, reservation.options, self.extras(reservation, "add")
-                ),
-            )
-        self._reload()
+            took |= self._write("opts", tag, options)
+        self._reload(took)
 
     def keep(self, reservation: Reservation) -> None:
         """Rewrite this client's region with the completion options."""
-        target = reservation.target
-        tag = self._tag(target)
-        options = reservation.completion.apply_to(reservation.options)
-        self._write(self.hostsfile, tag, [_host_line(target, tag)])
-        if self.optsfile:
-            self._write(
-                self.optsfile,
-                tag,
-                _option_lines(tag, options, self.extras(reservation, "remove")),
-            )
-        self._reload()
+        tag = self._tag(reservation.target)
+        options = _option_lines(
+            tag,
+            reservation.completion.apply_to(reservation.lease),
+            self.extras(reservation, "remove"),
+        )
+        self._require_optsfile(options)
+        took = self._write("hosts", tag, [_host_line(reservation, tag)])
+        if self.optsfile is not None:
+            took |= self._write("opts", tag, options)
+        self._reload(took)
 
     def remove(self, reservation: Reservation) -> None:
         tag = self._tag(reservation.target)
-        self._write(self.hostsfile, tag, [])
+        took = self._write("hosts", tag, [])
         if self.optsfile is not None:
-            self._write(self.optsfile, tag, [])
-        self._reload()
+            took |= self._write("opts", tag, [])
+        self._reload(took)
+
+    def _require_optsfile(self, options: List[str]) -> None:
+        """Refuse to arm a client whose options would have nowhere to go."""
+        if options and self.optsfile is None:
+            raise ConfigError(
+                "dnsmasq: this reservation serves options (the boot file among "
+                "them), and the URI has no optsfile=<path> to write them to; a "
+                "client armed without them boots without them. Add optsfile= "
+                "(the --dhcp-optsfile or --dhcp-optsdir location)"
+            )
 
     def _tag(self, target: Target) -> str:
-        """A dnsmasq tag for this client: its name, reduced to what a tag may hold."""
-        cleaned = "".join(
-            ch if ch.isalnum() or ch in "-_" else "-" for ch in str(target.name or "")
-        )
-        return cleaned.strip("-") or self.owner
+        """A dnsmasq tag for this client: its name, reduced to what a tag may hold.
+
+        A name that had to be reduced gets a digest of itself appended, so two
+        names that reduce alike (`web.01`, `web-01`) are two tags.
+        """
+        name = str(target.name or "")
+        cleaned = "".join(ch if ch.isalnum() or ch in "-_" else "-" for ch in name)
+        cleaned = cleaned.strip("-")
+        if cleaned == name and name:
+            return name
+        digest = _hashlib.sha1(name.encode("utf-8")).hexdigest()[:8]
+        return f"{cleaned or self.owner}-{digest}"
 
     # -- writing ----------------------------------------------------------
 
-    def _write(self, base: Any, tag: str, lines: List[str]) -> None:
-        """Put `lines` under `tag`, or remove that tag's entry when empty."""
-        if _is_directory(base):
-            self._write_file(base / f"{tag}.conf", lines)
-        else:
-            self._write_region(base, tag, lines)
+    def _directory(self, which: str) -> bool:
+        """Is the `hosts` or `opts` path a directory (one file per client)?"""
+        base = self.hostsfile if which == "hosts" else self.optsfile
+        return self._slashed[which] or _is_directory(base)
 
-    def _write_file(self, path: Any, lines: List[str]) -> None:
+    def _write(self, which: str, tag: str, lines: List[str]) -> bool:
+        """Put `lines` under `tag` in the `hosts` or `opts` path, or remove that
+        tag's entry when empty. True when an entry dnsmasq may have read
+        already was removed or changed."""
+        base = self.hostsfile if which == "hosts" else self.optsfile
+        if self._directory(which):
+            return self._write_file(base / f"{tag}.conf", lines)
+        return self._write_region(base, tag, lines)
+
+    def _write_file(self, path: Any, lines: List[str]) -> bool:
+        try:
+            before: Optional[str] = path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            before = None
         if not lines:
             try:
                 path.unlink()
             except FileNotFoundError:
                 pass  # removing twice is quiet: completion may re-run
-            return
-        self._atomic_write(path, "\n".join(lines) + "\n")
+            return before is not None
+        text = "\n".join(lines) + "\n"
+        if text == before:
+            return False
+        self._atomic_write(path, text)
+        return before is not None
 
-    def _write_region(self, path: Any, tag: str, lines: List[str]) -> None:
+    def _write_region(self, path: Any, tag: str, lines: List[str]) -> bool:
         """Replace only the owner's marked region, leaving every other line."""
         start = f"# >>> {self.owner} {tag}"
         end = f"# <<< {self.owner} {tag}"
@@ -197,7 +221,7 @@ class DnsmasqBackend(DHCPServer):
         except FileNotFoundError:
             existing = []
 
-        kept, skipping = [], False
+        kept, region, skipping = [], [], False
         for line in existing:
             if line.strip() == start:
                 skipping = True
@@ -205,12 +229,12 @@ class DnsmasqBackend(DHCPServer):
             if line.strip() == end:
                 skipping = False
                 continue
-            if not skipping:
-                kept.append(line)
+            (region if skipping else kept).append(line)
 
         if lines:
             kept += [start, *lines, end]
         self._atomic_write(path, "\n".join(kept) + ("\n" if kept else ""))
+        return bool(region) and region != list(lines)
 
     def _atomic_write(self, path: Any, text: str) -> None:
         """Write via a sibling temporary file where the path type allows a rename.
@@ -233,21 +257,37 @@ class DnsmasqBackend(DHCPServer):
 
     # -- reloading --------------------------------------------------------
 
-    def _reload(self) -> None:
+    def _reload(self, took_away: bool) -> None:
+        """Make dnsmasq read what was written.
+
+        A file needs `reload=` every time. A directory picks up new files by
+        itself but keeps serving a removed or changed one, so `took_away` --
+        an entry dnsmasq may have read is gone or different -- needs a SIGHUP:
+        `reload=` when given, else the local `pidfile`.
+        """
         if not self.reload_command:
-            if _is_directory(self.hostsfile):
+            if not self._directory("hosts"):
+                raise ConfigError(
+                    "dnsmasq: reload=<command> is required when hostsfile is a "
+                    "file (dnsmasq re-reads it only on SIGHUP); use a directory "
+                    "with --dhcp-hostsdir to need no reload for a new client"
+                )
+            if not took_away:
                 if not self._reload_warned:
                     LOGGER.info(
-                        "dnsmasq: no reload configured; assuming --dhcp-hostsdir/"
-                        "--dhcp-optsdir, which re-read changed files by themselves"
+                        "dnsmasq: a new entry needs no reload; --dhcp-hostsdir/"
+                        "--dhcp-optsdir read new files by themselves"
                     )
                     self._reload_warned = True
                 return
-            raise ConfigError(
-                "dnsmasq: reload=<command> is required when hostsfile is a file "
-                "(dnsmasq re-reads it only on SIGHUP); use a directory with "
-                "--dhcp-hostsdir to need no reload at all"
-            )
+            if self.host:
+                raise ConfigError(
+                    "dnsmasq: a running dnsmasq keeps serving a removed or changed "
+                    "--dhcp-hostsdir/--dhcp-optsdir entry until SIGHUP; give "
+                    "reload=<command> to run on the host over ssh"
+                )
+            _signal_pidfile(self.pidfile)
+            return
 
         if self.reload_command == "signal":
             if self.host:
@@ -269,6 +309,14 @@ class DnsmasqBackend(DHCPServer):
             raise ServerError(
                 f"dnsmasq: reload command {argv!r} failed ({exc.returncode})"
             ) from exc
+        except _subprocess.TimeoutExpired as exc:
+            raise ServerError(
+                f"dnsmasq: reload command {argv!r} did not finish in 60 seconds"
+            ) from exc
+        except OSError as exc:
+            raise ServerError(
+                f"dnsmasq: cannot run reload command {argv!r}: {exc}"
+            ) from exc
 
 
 def _require_sftp(uri: str) -> None:
@@ -286,51 +334,46 @@ def _require_sftp(uri: str) -> None:
         )
 
 
-def _host_line(target: Target, tag: str) -> str:
+def _host_line(reservation: Reservation, tag: str) -> str:
+    target = reservation.target
     mac = target.require_mac(
         "dnsmasq keys reservations by MAC; give the target a mac, or key it by one"
     )
     fields = [str(mac), f"set:{tag}"]
-    if target.ip:
-        fields.append(target.ip_text)
+    if reservation.ip_text:
+        fields.append(reservation.ip_text)
     if target.hostname:
         fields.append(target.hostname)
-    return "dhcp-host=" + ",".join(fields)
+    # A --dhcp-hostsfile line is the value of --dhcp-host, without the key.
+    return ",".join(fields)
 
 
 def _option_lines(
-    tag: str, options: DHCPOptions, extras: Optional[List[Any]] = None
+    tag: str, lease: DHCPLease, extras: Optional[List[Any]] = None
 ) -> List[str]:
-    """Translate the generic options into dnsmasq's own syntax."""
+    """What `lease` serves, as --dhcp-optsfile lines: --dhcp-option values.
+
+    dnsmasq(8) takes the header fields in an options file by these names, as
+    --dhcp-boot would set them; `bootfile-name` fills the file field unless
+    the client asks for option 67.
+    """
     lines: List[str] = []
-    boot_file = options.get("boot-file-name")
-    next_server = options.get("next-server")
-    if boot_file or next_server:
-        # next-server is not an option in dnsmasq: it is dhcp-boot's third field.
-        lines.append(
-            f"dhcp-boot=tag:{tag},{_value(boot_file) if boot_file else ''},,"
-            f"{_value(next_server) if next_server else ''}".rstrip(",")
-        )
-    for name, value in options.items():
-        if name in ("boot-file-name", "next-server"):
-            continue
-        code = _CODES.get(name)
-        if code is None:
-            code = name[len("option-") :] if name.startswith("option-") else name
-        lines.append(f"dhcp-option=tag:{tag},{code},{_value(value)}")
+    for name, value in (
+        ("bootfile-name", lease.file),
+        ("tftp-server", lease.sname),
+        ("server-ip-address", "" if lease.siaddr.is_unspecified else lease.siaddr),
+    ):
+        if value:
+            lines.append(f"tag:{tag},option:{name},{value}")
+    for code, value in _codes(lease.options):
+        lines.append(f"tag:{tag},{code},{_value(value)}")
     lines.extend(str(line) for line in (extras or ()))
     return lines
 
 
 def _codes(options: DHCPOptions) -> List[Tuple[str, Any]]:
-    """Options as (dnsmasq option code, value), the same mapping a tag line uses."""
-    pairs = []
-    for name, value in options.items():
-        code = _CODES.get(name)
-        if code is None:
-            code = name[len("option-") :] if name.startswith("option-") else name
-        pairs.append((str(code), value))
-    return pairs
+    """Options as (dnsmasq option code, plain value)."""
+    return [(str(int(code)), value) for code, value in plain_items(options)]
 
 
 def _value(value: Any) -> str:
@@ -340,7 +383,7 @@ def _value(value: Any) -> str:
 
 
 def _is_directory(path: Any) -> bool:
-    """Directory mode: an existing directory, or a path written with a slash."""
+    """An existing directory, or a path that still shows a trailing slash."""
     text = str(path)
     if text.endswith(("/", "\\")):
         return True
@@ -368,9 +411,25 @@ def _replace(tmp: Any, path: Any) -> None:
 
 
 def _signal_pidfile(pidfile: str) -> None:
-    """SIGHUP the dnsmasq whose pid is in `pidfile` (local only)."""
+    """SIGHUP the dnsmasq whose pid is in `pidfile` (local only).
+
+    :raises ConfigError: this platform has no SIGHUP.
+    :raises ServerError: the pidfile cannot be read, or the process signalled.
+    """
     import signal
 
-    with open(pidfile, encoding="utf-8") as handle:
-        pid = int(handle.read().strip())
-    _os.kill(pid, getattr(signal, "SIGHUP", signal.SIGTERM))
+    hangup = getattr(signal, "SIGHUP", None)
+    if hangup is None:
+        raise ConfigError(
+            "dnsmasq: this platform has no SIGHUP to signal dnsmasq with; give "
+            "reload=<command> instead"
+        )
+    try:
+        with open(pidfile, encoding="utf-8") as handle:
+            pid = int(handle.read().strip())
+        _os.kill(pid, hangup)
+    except (OSError, ValueError) as exc:
+        raise ServerError(
+            f"dnsmasq: cannot SIGHUP the dnsmasq in pidfile {pidfile!r}: {exc}; "
+            f"set pidfile= or reload="
+        ) from exc

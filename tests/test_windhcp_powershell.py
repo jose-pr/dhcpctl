@@ -69,10 +69,10 @@ try {
 
 #: What a client in 10.0.0.0/24 is served, with two name servers and no router.
 OPTIONS = {
-    "domain-name-servers": ["10.0.0.53", "10.0.0.54"],
+    "dns": ["10.0.0.53", "10.0.0.54"],
     "subnet-mask": "255.255.255.0",
     "broadcast-address": "10.0.0.255",
-    "boot-file-name": "pxelinux.0",
+    "bootfile-name": "pxelinux.0",
 }
 
 
@@ -81,11 +81,12 @@ def _reservation(name="web01", options=None):
         dhcpctl.Target(
             name,
             mac=MACAddress("aa:bb:cc:dd:ee:ff"),
-            ip=ipaddress.ip_address("10.0.0.10"),
             hostname="web01",
         ),
         dhcpctl.Scope("lan", network=ipaddress.ip_network("10.0.0.0/24")),
-        dhcpctl.DHCPOptions(OPTIONS if options is None else options),
+        dhcpctl.PYDHCP_CODES.lease(OPTIONS if options is None else options).replace(
+            ip="10.0.0.10"
+        ),
     )
 
 
@@ -299,7 +300,7 @@ def test_a_quoted_value_with_spaces_counts_as_one(tmp_path):
             "domain-name": "my domain",
             "subnet-mask": "255.255.255.0",
             "broadcast-address": "10.0.0.255",
-            "boot-file-name": "pxelinux.0",
+            "bootfile-name": "pxelinux.0",
         },
     )
     dump = _dump(

@@ -54,18 +54,22 @@ costs nothing and removes the whole command-line quoting question.
 
 from __future__ import annotations
 
+import base64 as _base64
 import json as _json
 import logging
 import os as _os
+import re as _re
 import subprocess as _subprocess
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 from urllib.parse import urlsplit
 
 from netimps import MACAddress
+from pydhcp.options import I32, U8, U16, U32, Boolean, IPv4AddressOption
+from pydhcp.options import List as CodecList
 
 from .._conditions import Condition
 from .._model import Reservation, Target
-from .._options import DHCPOptions
+from .._options import DHCPLease, DHCPOptionCode, DHCPOptions, plain_items
 from .._server import DEFAULT_OWNER, DHCPServer, Secrets
 from ..exceptions import (
     BackendUnavailableError,
@@ -78,37 +82,33 @@ __all__ = ["WinDHCPBackend"]
 
 LOGGER = logging.getLogger("dhcpctl")
 
-#: Generic option name -> Windows DHCP option id.
-_OPTION_IDS = {
-    "router": 3,
-    "subnet-mask": 1,
-    "broadcast-address": 28,
-    "domain-name-servers": 6,
-    "domain-name": 15,
-    "ntp-servers": 42,
-    "lease-time": 51,
-    "tftp-server-name": 66,
-    "boot-file-name": 67,
-    "vendor-class-identifier": 60,
-}
+#: Codes left off a Windows reservation: Windows defines no option 119 unless
+#: an administrator adds it, and setting an undefined option aborts the script.
+_SKIPPED = frozenset({DHCPOptionCode.DOMAIN_SEARCH})
 
-#: Windows DHCP option id -> the data type `netsh ... set reservedoptionvalue`
-#: wants. The cmdlets infer this from the option definition; netsh does not, and
-#: gets it wrong silently if told `STRING` for an address. Anything not listed
-#: (including a raw `option-NN`) is passed as STRING, which is what an unknown
-#: vendor option almost always is.
-_OPTION_TYPES = {
-    1: "IPADDRESS",  # subnet mask
-    3: "IPADDRESS",  # router
-    6: "IPADDRESS",  # domain name servers
-    15: "STRING",  # domain name
-    28: "IPADDRESS",  # broadcast address
-    42: "IPADDRESS",  # ntp servers
-    51: "DWORD",  # lease time
-    60: "STRING",  # vendor class identifier
-    66: "STRING",  # tftp server name
-    67: "STRING",  # boot file name
-}
+#: pydhcp item codec -> the data type `netsh ... set reservedoptionvalue` wants.
+#: The cmdlets infer it from the option definition; netsh does not, and stores an
+#: address told `STRING` wrongly without complaint. Anything else is STRING.
+_NETSH_TYPES = (
+    (IPv4AddressOption, "IPADDRESS"),
+    (U32, "DWORD"),
+    (I32, "DWORD"),
+    (U16, "WORD"),
+    (U8, "BYTE"),
+    (Boolean, "BYTE"),
+)
+
+
+def _netsh_type(code: Any) -> str:
+    """netsh's data type for `code`, a member of the bag's codemap."""
+    codec = code.get_type()
+    if issubclass(codec, CodecList):
+        codec = codec.item_type()
+    for base, name in _NETSH_TYPES:
+        if issubclass(codec, base):
+            return name
+    return "STRING"
+
 
 #: Runs each `Commands` entry as `netsh <args...>`. The arguments stay array
 #: elements -- never a string PowerShell re-parses -- so a value cannot become
@@ -169,6 +169,28 @@ ConvertTo-Json @{{ ok = $true }}
 """
 
 
+#: Reads the script whole from standard input and runs it as one scriptblock.
+#: `-Command -` reads standard input a line at a time: it runs only the first
+#: line of a multi-line block and exits 0 whatever fails. An error is written
+#: as plain text, where Windows PowerShell would wrap it in CLIXML.
+_BOOTSTRAP = (
+    "$ProgressPreference = 'SilentlyContinue'; $s = [Console]::In.ReadToEnd(); "
+    "try { & ([scriptblock]::Create($s)) } "
+    "catch { [Console]::Error.WriteLine($_.Exception.Message); exit 1 }"
+)
+
+#: How PowerShell is started for a script on standard input, locally or over ssh.
+POWERSHELL_ARGV = (
+    "powershell",
+    "-NoProfile",
+    "-NonInteractive",
+    "-EncodedCommand",
+    _base64.b64encode(_BOOTSTRAP.encode("utf-16-le")).decode("ascii"),
+)
+
+#: What `_SCRIPT` prints last; output without it means the script did not finish.
+_FINISHED = _re.compile(r'"ok"\s*:\s*true')
+
 #: Thrown by the policy script when the host has no `DhcpServer` module, so the
 #: Python side can turn it into a `ConditionMissingError` carrying the recipe. A
 #: marker rather than a message match: the cmdlets' own errors are localised.
@@ -189,12 +211,19 @@ _POLICY_BODY = [
     # lists one. Policies arrived with the DhcpServer module after netsh was
     # frozen, so they are cmdlet-only whatever `method=` says, and a host without
     # the module cannot have them created from here at all.
-    "if (-not (Get-Command Add-DhcpServerv4Policy -ErrorAction SilentlyContinue)) {",
+    "$cmdlets = [bool](Get-Command Add-DhcpServerv4Policy -ErrorAction SilentlyContinue)",
+    # A shared policy is the estate's: where it cannot even be looked up, it is
+    # trusted to exist, as the operator was told to create it.
+    "if (-not $cmdlets -and -not $p.Shared) {",
     "  throw '{marker}'",
     "}",
-    "foreach ($pol in $p.Policies) {",
+    "foreach ($pol in $(if ($cmdlets) { $p.Policies } else { @() })) {",
     "  $common = @{}",
     "  if ($p.ComputerName) { $common['ComputerName'] = $p.ComputerName }",
+    "  $existing = Get-DhcpServerv4Policy -ScopeId $p.ScopeId -Name $pol.Name"
+    " @common -ErrorAction SilentlyContinue",
+    # Shared: it exists -- use it, and change nothing about it.
+    "  if ($existing -and $p.Shared) { continue }",
     # A policy references a user/vendor class **by name**, and Windows refuses
     # one that is not defined on the server: "The specified User class iPXE does
     # not exist on DHCP server" (measured on Server 2025, 2026-10-03). So the
@@ -208,8 +237,6 @@ _POLICY_BODY = [
     " @common",
     "    }",
     "  }",
-    "  $existing = Get-DhcpServerv4Policy -ScopeId $p.ScopeId -Name $pol.Name"
-    " @common -ErrorAction SilentlyContinue",
     "  if (-not $existing) {",
     "    $new = @{ Name = $pol.Name; ScopeId = $p.ScopeId; Condition = 'AND' }",
     "    if ($pol.UserClass)   { $new['UserClass']   = @('EQ', $pol.UserClass) }",
@@ -238,8 +265,7 @@ _POLICY_BODY = [
 class WinDHCPBackend(DHCPServer):
     """`windhcp://[user@]host/?transport=local|ssh|winrm&method=powershell|netsh&server=<dhcp server>`
 
-    Every other query key is a client option. The scope comes from the
-    reservation, not from here. The account and WinRM's password are the
+    The scope comes from the reservation, not from here. The account and WinRM's password are the
     `user` and `password` secrets: the URI's, else the caller's.
     """
 
@@ -248,9 +274,14 @@ class WinDHCPBackend(DHCPServer):
     )
 
     def __init__(
-        self, uri: str, *, secrets: Secrets = None, owner: str = DEFAULT_OWNER
+        self,
+        uri: str,
+        *,
+        secrets: Secrets = None,
+        owner: str = DEFAULT_OWNER,
+        codes: Any = None,
     ) -> None:
-        super().__init__(uri, secrets=secrets, owner=owner)
+        super().__init__(uri, secrets=secrets, owner=owner, codes=codes)
         parts = urlsplit(uri)
         self.hostname = parts.hostname or "localhost"
         # No host to reach means the shell is here. Only an *empty* host: a named
@@ -303,11 +334,12 @@ class WinDHCPBackend(DHCPServer):
             self._add_netsh(reservation)
             return
         target = reservation.target
-        options = reservation.options
+        options = _served(reservation.lease)
+        _warn_dropped(reservation.lease)
         overridden = self._overridden_ids(reservation.conditions.values())
         payload = {
             "ScopeId": _scope(reservation),
-            "IPAddress": target.ip_text,
+            "IPAddress": _address(reservation),
             "ClientId": _client_id(target),
             "Name": str(target.name),
             "ComputerName": self.server,
@@ -341,6 +373,7 @@ class WinDHCPBackend(DHCPServer):
     def remove(self, reservation: Reservation) -> None:
         if self.method == "netsh":
             self._remove_netsh(reservation)
+            self._remove_policies(reservation, reservation.conditions.values())
             return
         target = reservation.target
         payload = {
@@ -362,6 +395,7 @@ class WinDHCPBackend(DHCPServer):
         ]
         body.extend(_script_lines(self.extras(reservation, "remove")))
         self.run(payload, body)
+        self._remove_policies(reservation, reservation.conditions.values())
 
     # -- completion (keep the reservation, drop the boot options) ----------
 
@@ -372,12 +406,16 @@ class WinDHCPBackend(DHCPServer):
         reservation: the address, its name and every other option stay exactly as
         they were, which is the point of keeping it.
         """
-        options = reservation.completion.apply_to(reservation.options)
-        applied = dict(_option_ids(reservation.options))
+        options = _served(reservation.completion.apply_to(reservation.lease))
+        applied = dict(_option_ids(_served(reservation.lease)))
         wanted = dict(_option_ids(options))
+        _warn_dropped(reservation.completion.apply_to(reservation.lease))
+        if self.method == "netsh":
+            self._keep_netsh(reservation, options, applied, wanted)
+            return
         payload = {
             "ScopeId": _scope(reservation),
-            "IPAddress": reservation.target.ip_text,
+            "IPAddress": _address(reservation),
             "ComputerName": self.server,
             "Set": [
                 {"Id": option_id, "Value": [str(v) for v in _values(value)]}
@@ -424,8 +462,36 @@ class WinDHCPBackend(DHCPServer):
         conditions = list(conditions)
         if not conditions:
             return
+        payload = {
+            "ScopeId": _scope(reservation),
+            "ComputerName": self.server,
+            "Shared": self.conditions == "shared",
+            "Policies": self._policies(reservation, conditions),
+        }
+        marker = f"{self.owner.upper()}-{_NO_POLICY_CMDLETS}"
+        body = [line.replace("{marker}", marker) for line in _POLICY_BODY]
+        try:
+            self.run(payload, body)
+        except Exception as exc:  # noqa: BLE001 - transport errors vary
+            if marker not in str(exc):
+                raise
+            # Step 3 of the ladder: it cannot be created from here, so hand over
+            # what someone with the module (RSAT anywhere, `-ComputerName` this
+            # server) must run once. After that, arming needs none of this.
+            raise ConditionMissingError(
+                f"{self.hostname} has no DhcpServer PowerShell module, and netsh "
+                f"has no policy support at all, so {self.owner} cannot create the "
+                f"policy for "
+                f"{', '.join('dhcp_when.' + c.name for c in conditions)}. Run this "
+                f"once as a DHCP administrator, from any host with RSAT:",
+                self._recipe(reservation, conditions),
+            ) from exc
+
+    def _policies(
+        self, reservation: Reservation, conditions: List[Condition]
+    ) -> List[Dict[str, Any]]:
+        """The policies that serve these conditions to this target, in order."""
         target = reservation.target
-        scope = _scope(reservation)
         mac = "" if self.conditions == "shared" else _netsh_client_id(target)
         policies = []
         order = 1
@@ -440,7 +506,7 @@ class WinDHCPBackend(DHCPServer):
                     "Classes": _classes_for(condition),
                     "Options": [
                         {"Id": option_id, "Value": [str(v) for v in _values(value)]}
-                        for option_id, value in _option_ids(condition.options)
+                        for option_id, value in _option_ids(_served(condition.lease))
                     ],
                 }
             )
@@ -448,32 +514,7 @@ class WinDHCPBackend(DHCPServer):
         base = self._base_policy(reservation, conditions, mac, order)
         if base is not None:
             policies.append(base)
-        payload = {
-            "ScopeId": scope,
-            "ComputerName": self.server,
-            "Policies": policies,
-        }
-        marker = f"{self.owner.upper()}-{_NO_POLICY_CMDLETS}"
-        body = [line.replace("{marker}", marker) for line in _POLICY_BODY]
-        try:
-            self.run(payload, body)
-        except Exception as exc:  # noqa: BLE001 - transport errors vary
-            if marker not in str(exc):
-                raise
-            # Step 3 of the ladder: it cannot be created from here, so hand over
-            # what someone with the module (RSAT anywhere, `-ComputerName` this
-            # server) must run once. After that, arming needs none of this.
-            recipes = "\n\n".join(
-                self.condition_recipe(reservation, c) for c in conditions
-            )
-            raise ConditionMissingError(
-                f"{self.hostname} has no DhcpServer PowerShell module, and netsh "
-                f"has no policy support at all, so {self.owner} cannot create the "
-                f"policy for "
-                f"{', '.join('dhcp_when.' + c.name for c in conditions)}. Run this "
-                f"once as a DHCP administrator, from any host with RSAT:",
-                recipes,
-            ) from exc
+        return policies
 
     def _overridden_ids(self, conditions: Iterable[Condition]) -> Set[int]:
         """Option ids these conditions override, which the reservation must not set.
@@ -484,7 +525,9 @@ class WinDHCPBackend(DHCPServer):
         """
         ids = set()
         for condition in conditions:
-            ids.update(option_id for option_id, _ in _option_ids(condition.options))
+            ids.update(
+                option_id for option_id, _ in _option_ids(_served(condition.lease))
+            )
         return ids
 
     def _base_policy(
@@ -507,7 +550,7 @@ class WinDHCPBackend(DHCPServer):
         overridden = self._overridden_ids(conditions)
         if not overridden:
             return None
-        options = reservation.options
+        options = _served(reservation.lease)
         values = [
             {"Id": option_id, "Value": [str(v) for v in _values(value)]}
             for option_id, value in _option_ids(options)
@@ -534,22 +577,36 @@ class WinDHCPBackend(DHCPServer):
         `shared` mode the policy is the estate's, and removing it would break every
         other target that names the same condition.
         """
-        if self.conditions == "shared":
+        self._remove_policies(reservation, [condition])
+
+    def _remove_policies(
+        self, reservation: Reservation, conditions: Iterable[Condition]
+    ) -> None:
+        """Remove this target's policies for `conditions`, and its base policy.
+
+        Only in `target` mode, and only what this target created: a removed
+        client's MAC-matched policies would go on answering it.
+        """
+        conditions = list(conditions)
+        if self.conditions == "shared" or not conditions:
             return
         target = reservation.target
-        names = [self._policy_name(target, condition.name), self._policy_name(target)]
+        names = [self._policy_name(target, c.name) for c in conditions]
         payload = {
             "ScopeId": _scope(reservation),
             "ComputerName": self.server,
-            "Names": names,
+            "Names": names + [self._policy_name(target)],
         }
         body = [
             "$common = @{}",
             "if ($p.ComputerName) { $common['ComputerName'] = $p.ComputerName }",
-            "foreach ($n in $p.Names) {",
+            # Without the module no policy could have been made from here.
+            "if (Get-Command Remove-DhcpServerv4Policy -ErrorAction SilentlyContinue) {",
+            "  foreach ($n in $p.Names) {",
             # Already gone is success: completion re-runs.
-            "  Remove-DhcpServerv4Policy -Name $n -ScopeId $p.ScopeId @common"
+            "    Remove-DhcpServerv4Policy -Name $n -ScopeId $p.ScopeId @common"
             " -ErrorAction SilentlyContinue",
+            "  }",
             "}",
         ]
         self.run(payload, body)
@@ -568,37 +625,50 @@ class WinDHCPBackend(DHCPServer):
 
         netsh cannot create a policy, and an operator without DHCP-admin rights
         cannot create one at all -- in both cases this is what they hand to
-        someone who can. Same text as the error, by construction.
+        someone who can. It is built from the same policies `add` applies, so
+        in `target` mode it names this target's MAC-matched pair. Every value is
+        a quoted literal.
         """
-        scope = _scope(reservation)
+        return self._recipe(reservation, [condition])
+
+    def _recipe(self, reservation: Reservation, conditions: List[Condition]) -> str:
+        server = f" -ComputerName {_ps_quote(self.server)}" if self.server else ""
+        names = ", ".join(repr(c.name) for c in conditions)
         lines = [
-            f"# {self.owner}: create the DHCP policy {condition.name!r} once, as "
-            f"an admin",
-            f"$scope = '{scope}'",
+            f"# {self.owner}: create the DHCP policies for {names} once, as an admin",
+            f"$scope = {_ps_quote(_scope(reservation))}",
         ]
-        server = f" -ComputerName '{self.server}'" if self.server else ""
-        for cls in _classes_for(condition):
-            # Without the class the policy cannot be created at all.
-            lines.append(
-                f"if (-not (Get-DhcpServerv4Class -Name '{cls['Name']}' "
-                f"-Type {cls['Type']}{server} -ErrorAction SilentlyContinue)) {{ "
-                f"Add-DhcpServerv4Class -Name '{cls['Name']}' -Type {cls['Type']} "
-                f"-Data '{cls['Data']}'{server} }}"
-            )
-        args = [f"-Name '{condition.name}'", "-ScopeId $scope", "-Condition AND"]
-        if condition.match.get("user-class"):
-            args.append(f"-UserClass EQ,'{condition.match['user-class']}'")
-        if condition.match.get("vendor-class"):
-            args.append(f"-VendorClass EQ,'{condition.match['vendor-class']}'")
-        if self.server:
-            args.append(f"-ComputerName '{self.server}'")
-        lines.append("Add-DhcpServerv4Policy " + " ".join(args))
-        for option_id, value in _option_ids(condition.options):
-            rendered = ",".join(f"'{v}'" for v in _values(value))
-            lines.append(
-                f"Set-DhcpServerv4OptionValue -PolicyName '{condition.name}' "
-                f"-ScopeId $scope -OptionId {option_id} -Value {rendered}{server}"
-            )
+        for policy in self._policies(reservation, conditions):
+            name = _ps_quote(policy["Name"])
+            for cls in policy["Classes"]:
+                # Without the class the policy cannot be created at all.
+                cname = _ps_quote(cls["Name"])
+                lines.append(
+                    f"if (-not (Get-DhcpServerv4Class -Name {cname} "
+                    f"-Type {cls['Type']}{server} -ErrorAction SilentlyContinue)) {{ "
+                    f"Add-DhcpServerv4Class -Name {cname} -Type {cls['Type']} "
+                    f"-Data {_ps_quote(cls['Data'])}{server} }}"
+                )
+            args = [f"-Name {name}", "-ScopeId $scope", "-Condition AND"]
+            for key, flag in (
+                ("UserClass", "-UserClass"),
+                ("VendorClass", "-VendorClass"),
+                ("MacAddress", "-MacAddress"),
+            ):
+                if policy[key]:
+                    args.append(f"{flag} EQ,{_ps_quote(policy[key])}")
+            lines.append("Add-DhcpServerv4Policy " + " ".join(args) + server)
+            if self.conditions == "target":
+                lines.append(
+                    f"Set-DhcpServerv4Policy -Name {name} -ScopeId $scope "
+                    f"-ProcessingOrder {int(policy['Order'])}{server}"
+                )
+            for option in policy["Options"]:
+                rendered = ",".join(_ps_quote(v) for v in option["Value"])
+                lines.append(
+                    f"Set-DhcpServerv4OptionValue -PolicyName {name} -ScopeId $scope "
+                    f"-OptionId {int(option['Id'])} -Value {rendered}{server}"
+                )
         return "\n".join(lines)
 
     # -- method=netsh ------------------------------------------------------
@@ -617,7 +687,8 @@ class WinDHCPBackend(DHCPServer):
 
     def _add_netsh(self, reservation: Reservation) -> str:
         target = reservation.target
-        options = reservation.options
+        options = _served(reservation.lease)
+        _warn_dropped(reservation.lease)
         scope = _scope(reservation)
         base = self._netsh_scope(scope)
         commands = [
@@ -629,7 +700,7 @@ class WinDHCPBackend(DHCPServer):
                 + [
                     "add",
                     "reservedip",
-                    target.ip_text,
+                    _address(reservation),
                     _netsh_client_id(target),
                     str(target.name),
                     self.owner,
@@ -639,6 +710,7 @@ class WinDHCPBackend(DHCPServer):
             }
         ]
         overridden = self._overridden_ids(reservation.conditions.values())
+        codes = {int(code): code for code, _ in plain_items(options)}
         for option_id, value in _option_ids(options):
             if option_id in overridden:
                 # Served by a policy instead; on the reservation it would win.
@@ -649,9 +721,9 @@ class WinDHCPBackend(DHCPServer):
                     + [
                         "set",
                         "reservedoptionvalue",
-                        target.ip_text,
+                        _address(reservation),
                         str(option_id),
-                        _OPTION_TYPES.get(option_id, "STRING"),
+                        _netsh_type(codes[option_id]),
                     ]
                     # Each value is its own argument: that is how netsh takes a
                     # multi-valued option (two name servers, say).
@@ -659,9 +731,12 @@ class WinDHCPBackend(DHCPServer):
                     "Ignore": False,
                 }
             )
+        # What was sent, not what the lease holds: an overridden option is
+        # served by a policy and was never set on the reservation.
         verify = [
             {"Id": str(option_id), "Count": len(_values(value))}
             for option_id, value in _option_ids(options)
+            if option_id not in overridden
         ]
         extra_commands, extra_lines = _split_extras(self.extras(reservation, "add"))
         # A netsh command from `extras()` runs after the reservation and its
@@ -675,8 +750,53 @@ class WinDHCPBackend(DHCPServer):
         body.extend(_NETSH_VERIFY)
         payload = {
             "Commands": commands,
-            "IPAddress": target.ip_text,
+            "IPAddress": _address(reservation),
             "Verify": verify,
+            "VerifyArgs": base + ["dump"],
+        }
+        return self.run(payload, body)
+
+    def _keep_netsh(
+        self,
+        reservation: Reservation,
+        options: DHCPOptions,
+        applied: Dict[int, Any],
+        wanted: Dict[int, Any],
+    ) -> str:
+        """`keep` through netsh: set the wanted options, delete the rest."""
+        address = _address(reservation)
+        base = self._netsh_scope(_scope(reservation))
+        codes = {int(code): code for code, _ in plain_items(options)}
+        commands = [
+            {
+                "Args": base
+                + ["set", "reservedoptionvalue", address, str(option_id)]
+                + [_netsh_type(codes[option_id])]
+                + [str(item) for item in _values(value)],
+                "Ignore": False,
+            }
+            for option_id, value in wanted.items()
+        ]
+        commands += [
+            # Already absent is success: completion re-runs.
+            {
+                "Args": base
+                + ["delete", "reservedoptionvalue", address, str(option_id)],
+                "Ignore": True,
+            }
+            for option_id in applied
+            if option_id not in wanted
+        ]
+        extra_commands, extra_lines = _split_extras(self.extras(reservation, "remove"))
+        commands.extend(extra_commands)
+        body = list(_NETSH_BODY) + extra_lines + list(_NETSH_VERIFY)
+        payload = {
+            "Commands": commands,
+            "IPAddress": address,
+            "Verify": [
+                {"Id": str(option_id), "Count": len(_values(value))}
+                for option_id, value in wanted.items()
+            ],
             "VerifyArgs": base + ["dump"],
         }
         return self.run(payload, body)
@@ -692,7 +812,7 @@ class WinDHCPBackend(DHCPServer):
                 + [
                     "delete",
                     "reservedip",
-                    target.ip_text,
+                    _address(reservation),
                     _netsh_client_id(target),
                 ],
                 "Ignore": True,
@@ -708,32 +828,34 @@ class WinDHCPBackend(DHCPServer):
 
     def script_for(self, payload: Dict[str, Any], body: List[str]) -> str:
         """The script we will run: parameters as data, never as source."""
+        # json.dumps escapes every non-ASCII character, typographic quotes
+        # included, so doubling the ASCII quote is all the literal needs.
         encoded = _json.dumps(payload).replace("'", "''")
         return _SCRIPT.format(payload=encoded, body="\n".join(body))
 
     def run(self, payload: Dict[str, Any], body: List[str]) -> str:
-        """Run `body` on the transport, with `payload` as `$p`; its output."""
+        """Run `body` on the transport, with `payload` as `$p`; its output.
+
+        :raises ServerError: the script failed, or ended without reaching its
+            last line.
+        """
         script = self.script_for(payload, body)
         if self.transport == "winrm":
-            return self._run_winrm(script)
-        if self.transport == "local":
-            return self._run_local(script)
-        return self._run_ssh(script)
+            output = self._run_winrm(script)
+        elif self.transport == "local":
+            output = self._run_local(script)
+        else:
+            output = self._run_ssh(script)
+        if not _FINISHED.search(output or ""):
+            raise ServerError(
+                f"windhcp: the {self.transport} PowerShell script ended without "
+                f"finishing: {(output or '').strip() or 'no output'}"
+            )
+        return output
 
     def _run_local(self, script: str) -> str:
-        """Feed the script to PowerShell on this machine.
-
-        The same script, payload and error handling as the ssh transport, which
-        already pipes into `powershell -Command -`; the only difference is that
-        nothing is in between.
-        """
-        argv = [
-            "powershell",
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            "-",
-        ]
+        """Feed the script to PowerShell on this machine, as ssh does remotely."""
+        argv = list(POWERSHELL_ARGV)
         LOGGER.debug("windhcp local: %s", argv)
         completed = _subprocess.run(
             argv, input=script, capture_output=True, text=True, timeout=120
@@ -748,17 +870,7 @@ class WinDHCPBackend(DHCPServer):
     def _run_ssh(self, script: str) -> str:
         """Feed the script to PowerShell over the system ssh client."""
         destination = f"{self.user}@{self.hostname}" if self.user else self.hostname
-        argv = [
-            "ssh",
-            "-p",
-            str(self.port),
-            destination,
-            "powershell",
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            "-",
-        ]
+        argv = ["ssh", "-p", str(self.port), destination, *POWERSHELL_ARGV]
         LOGGER.debug("windhcp ssh: %s", argv)
         completed = _subprocess.run(
             argv, input=script, capture_output=True, text=True, timeout=120
@@ -816,10 +928,8 @@ def _classes_for(condition: Condition) -> List[Dict[str, str]]:
 def _split_extras(extras: List[Any]) -> Tuple[List[Dict[str, Any]], List[str]]:
     """Sort `extras()` output into netsh commands and PowerShell lines.
 
-    A mapping is a netsh command (`{"Args": [...], "Ignore": False}`); `Args` may
-    be a list or a single string that is split on whitespace, because a config
-    `raw.windhcp.add=dhcp server scope ... add ...` has nowhere to put a list.
-    Anything else is a PowerShell line, which is valid under either method --
+    A mapping is a netsh command (`{"Args": [...], "Ignore": False}`), its
+    arguments a list. Anything else is a PowerShell line, which is valid under either method --
     netsh mode is still PowerShell, it just calls netsh.
     """
     commands: List[Dict[str, Any]] = []
@@ -827,10 +937,15 @@ def _split_extras(extras: List[Any]) -> Tuple[List[Dict[str, Any]], List[str]]:
     for extra in extras:
         if isinstance(extra, dict):
             args = extra.get("Args", [])
-            if isinstance(args, str):
-                args = args.split()
+            if isinstance(args, (str, bytes)):
+                raise ConfigError(
+                    f"a netsh command's Args is a list of arguments, not {args!r}"
+                )
             commands.append(
-                {"Args": [str(a) for a in args], "Ignore": bool(extra.get("Ignore"))}
+                {
+                    "Args": [str(a) for a in args],
+                    "Ignore": bool(extra.get("Ignore")),
+                }
             )
         else:
             lines.append(str(extra))
@@ -860,9 +975,17 @@ def _script_lines(extras: List[Any]) -> List[str]:
     return lines
 
 
-def _ps_quote(value: str) -> str:
-    """A PowerShell single-quoted literal. Only for arguments built here."""
-    return "'" + str(value).replace("'", "''") + "'"
+#: What closes a PowerShell single-quoted string: the ASCII quote and the four
+#: typographic single quotes, each escaped by doubling it.
+_PS_QUOTES = "'\u2018\u2019\u201a\u201b"
+
+
+def _ps_quote(value: Any) -> str:
+    """A PowerShell single-quoted literal of `value`, whatever it holds."""
+    text = str(value)
+    for quote in _PS_QUOTES:
+        text = text.replace(quote, quote * 2)
+    return "'" + text + "'"
 
 
 def _text(value: Any) -> str:
@@ -887,6 +1010,11 @@ def _require_mac(target: Target) -> MACAddress:
     return target.require_mac("a Windows DHCP reservation is identified by one")
 
 
+def _address(reservation: Reservation) -> str:
+    """A Windows reservation is an address: the client's, or a clear error."""
+    return str(reservation.require_ip("a Windows DHCP reservation is an address"))
+
+
 def _client_id(target: Target) -> str:
     """Windows identifies a reservation by MAC, in its hyphen spelling."""
     return _require_mac(target).format("-")
@@ -904,22 +1032,44 @@ def _values(value: Any) -> List[Any]:
     return [value]
 
 
+def _served(lease: DHCPLease) -> DHCPOptions:
+    """What Windows serves for `lease`, all of it options.
+
+    A Windows reservation has no BOOTP header fields of its own, so the boot
+    file is option 67 and the server name option 66, unless the lease sets
+    those options itself; `siaddr` has no Windows equivalent.
+    """
+    options = lease.options.copy()
+    for code, value in (
+        (DHCPOptionCode.BOOTFILE_NAME, lease.file),
+        (DHCPOptionCode.TFTP_SERVER, lease.sname),
+    ):
+        if value and code not in options:
+            options[code] = value
+    return options
+
+
+def _warn_dropped(lease: DHCPLease) -> None:
+    """Say what a Windows reservation is not given, rather than drop it silently."""
+    dropped = [f"option {int(code)}" for code in lease.options if code in _SKIPPED]
+    if not lease.siaddr.is_unspecified:
+        dropped.append(f"next-server {lease.siaddr}")
+    if dropped:
+        LOGGER.warning(
+            "windhcp: a Windows reservation cannot carry %s; it is not sent",
+            ", ".join(dropped),
+        )
+
+
 def _option_ids(options: DHCPOptions) -> List[Tuple[int, Any]]:
-    """Generic options as (option id, value) pairs Windows understands.
+    """Options as (option id, value) pairs: the id is the code.
 
     The value is **unformatted**: the cmdlets take a multi-valued option as one
     comma-joined string (`_value`), netsh as one argument per value (`_values`),
     and joining it here would have made the second impossible.
     """
-    pairs: List[Tuple[int, Any]] = []
-    for name, value in options.items():
-        option_id = _OPTION_IDS.get(name)
-        if option_id is None:
-            if name.startswith("option-"):
-                option_id = int(name[len("option-") :])
-            elif name.isdigit():
-                option_id = int(name)
-            else:  # pragma: no cover - unknown names are refused earlier
-                continue
-        pairs.append((option_id, value))
-    return pairs
+    return [
+        (int(code), value)
+        for code, value in plain_items(options)
+        if code not in _SKIPPED
+    ]

@@ -4,8 +4,9 @@
 import dhcpctl
 
 server = dhcpctl.connect("kea://kea01:8000/?service=dhcp4")
-target = dhcpctl.Target("web01", mac=MACAddress("aa:bb:cc:dd:ee:ff"), ip=...)
-server.add(dhcpctl.Reservation(target, scope, server.client_options({...})))
+target = dhcpctl.Target("web01", mac=MACAddress("aa:bb:cc:dd:ee:ff"))
+lease = server.codes.lease({"router": "10.0.0.1", "file": "undionly.kpxe"})
+server.add(dhcpctl.Reservation(target, scope, lease.replace(ip="10.0.0.10")))
 ```
 
 Backends are chosen by URI scheme (`dnsmasq`, `kea`/`keas`, `dhcpd`,
@@ -23,13 +24,16 @@ from ._completion import BOOT_OPTIONS, Completion, parse_completion
 from ._conditions import MATCH_KEYS, NAME_CHARS, Condition, parse_conditions
 from ._model import NULL_MAC, Reservation, Scope, Target
 from ._options import (
-    APPLY_TIME,
-    GENERIC_OPTIONS,
-    OPTIONS_BUILDER,
+    BOOT_FIELDS,
     PHASES,
-    RAW_PREFIX,
+    PYDHCP_CODES,
+    DHCPLease,
+    DHCPOptionCode,
     DHCPOptions,
-    is_option,
+    OptionCodes,
+    option_codes,
+    plain_items,
+    UNSPECIFIED,
 )
 from ._registry import (
     ENTRY_POINT_GROUP,
@@ -74,14 +78,17 @@ __all__ = [
     "Target",
     "Scope",
     "NULL_MAC",
-    # options
+    # what is served
+    "DHCPLease",
+    "BOOT_FIELDS",
     "DHCPOptions",
-    "GENERIC_OPTIONS",
-    "APPLY_TIME",
-    "OPTIONS_BUILDER",
-    "RAW_PREFIX",
+    "DHCPOptionCode",
     "PHASES",
-    "is_option",
+    "OptionCodes",
+    "option_codes",
+    "PYDHCP_CODES",
+    "plain_items",
+    "UNSPECIFIED",
     # conditions and completion
     "Condition",
     "MATCH_KEYS",

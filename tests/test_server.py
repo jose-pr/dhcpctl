@@ -7,9 +7,11 @@ condition) rather than quietly doing nothing.
 The `extras()` extension point's worked example is the iPXE chainload: a PXE ROM
 must be handed the iPXE binary, and iPXE itself must then be handed the script,
 or it loads itself forever. No backend models that, so each one has to be told
-in its own language -- from the URI (`raw.<scheme>`), from the reservation, or
-from a subclass that can see the client.
+in its own language -- from the reservation's `extras`, or from a subclass that
+can see the client. A connection URI carries none.
 """
+
+import ipaddress
 
 import pytest
 
@@ -25,13 +27,13 @@ IPXE_DHCPD = (
 IPXE = {
     "ipxe": {
         "match": {"user-class": "iPXE"},
-        "options": {"boot-file-name": "boot.ipxe"},
+        "options": {"bootfile-name": "boot.ipxe"},
     }
 }
 WINPE = {
     "winpe": {
         "match": {"vendor-class": "PXEClient:Arch:00000"},
-        "options": {"boot-file-name": "wdsnbp.com"},
+        "options": {"bootfile-name": "wdsnbp.com"},
     }
 }
 
@@ -141,52 +143,70 @@ def test_a_missing_or_null_mac_is_named(reservation):
 
 
 def test_a_client_without_an_address_has_empty_ip_text(reservation):
-    assert reservation(ip=None).target.ip_text == ""
-    assert reservation().target.ip_text == "10.0.0.10"
+    assert reservation(ip=None).ip_text == ""
+    assert reservation().ip_text == "10.0.0.10"
+
+
+def test_a_reservation_without_a_lease_serves_nothing():
+    reservation = dhcpctl.Reservation(dhcpctl.Target("web01"))
+    lease = reservation.lease
+    assert lease.ip == dhcpctl.UNSPECIFIED and reservation.ip_text == ""
+    assert lease.siaddr == dhcpctl.UNSPECIFIED and lease.file == ""
+    assert len(lease.options) == 0
+    assert not reservation.completion
+
+
+def test_an_address_is_required_only_where_a_server_needs_one():
+    reservation = dhcpctl.Reservation(dhcpctl.Target("web01"))
+    with pytest.raises(dhcpctl.ConfigError, match="'web01' has no ip address"):
+        reservation.require_ip("a dhcpd host carries a fixed address")
+    lease = dhcpctl.DHCPLease("10.0.0.10")
+    assert dhcpctl.Reservation(dhcpctl.Target("web01"), lease=lease).require_ip(
+        "x"
+    ) == ipaddress.IPv4Address("10.0.0.10")
 
 
 # -- extras() ----------------------------------------------------------------
 
 
-def test_extras_defaults_to_the_configured_raw_lines(reservation):
-    server = dhcpctl.connect("dhcpd://dhcp01/?raw.dhcpd=" + "log(concat(1));")
-    assert server.extras(reservation(), "add") == ["log(concat(1));"]
-    # A bare `raw.<scheme>` belongs to arming, not teardown.
+def test_extras_are_the_reservations_for_that_phase(reservation):
+    server = dhcpctl.connect("dhcpd://dhcp01/")
+    r = reservation(extras={"add": ["a;", "b;"], "remove": ["c;"]})
+    assert server.extras(r, "add") == ["a;", "b;"]
+    assert server.extras(r, "remove") == ["c;"]
+    assert server.extras(reservation(), "add") == []
     assert server.extras(reservation(), "remove") == []
 
 
-def test_a_raw_fragment_can_name_the_teardown_phase(reservation):
-    server = dhcpctl.connect("dhcpd://dhcp01/?raw.dhcpd.remove=" + "log(concat(2));")
-    assert server.extras(reservation(), "add") == []
-    assert server.extras(reservation(), "remove") == ["log(concat(2));"]
+@pytest.mark.parametrize("phase, other", [("add", "remove"), ("remove", "add")])
+def test_extras_of_one_phase_never_appear_in_the_other(reservation, phase, other):
+    server = dhcpctl.connect("dhcpd://dhcp01/")
+    r = reservation(extras={phase: ["log(concat(1));"]})
+    assert server.extras(r, phase) == ["log(concat(1));"]
+    assert server.extras(r, other) == []
 
 
-def test_both_phases_can_be_given_at_once(reservation):
-    server = dhcpctl.connect(
-        "dhcpd://dhcp01/?raw.dhcpd=a;&raw.dhcpd.add=b;&raw.dhcpd.remove=c;"
-    )
-    # The unsuffixed one first: it was written as "the" fragment.
-    assert server.extras(reservation(), "add") == ["a;", "b;"]
-    assert server.extras(reservation(), "remove") == ["c;"]
-
-
-def test_raw_fragments_for_another_scheme_are_ignored(reservation):
-    server = dhcpctl.connect("dhcpd://dhcp01/?raw.dnsmasq=x")
-    assert server.extras(reservation(), "add") == []
-
-
-def test_the_reservation_extras_follow_the_uri_ones(reservation):
-    server = dhcpctl.connect("dhcpd://dhcp01/?raw.dhcpd=a;&raw.dhcpd.remove=c;")
-    r = reservation(extras={"add": ["b;"], "remove": ["d;"]})
-    assert server.extras(r, "add") == ["a;", "b;"]
-    assert server.extras(r, "remove") == ["c;", "d;"]
+def test_extras_is_a_copy_of_the_reservations(reservation):
+    server = dhcpctl.connect("dhcpd://dhcp01/")
+    r = reservation(extras={"add": ["a;"]})
+    server.extras(r, "add").append("b;")
+    assert list(r.extras["add"]) == ["a;"]
 
 
 def test_an_unknown_phase_is_refused(reservation):
     server = dhcpctl.connect("dhcpd://dhcp01/")
     with pytest.raises(ValueError, match="phase must be one of"):
         server.extras(reservation(), "bootstrap")
+    # ... even when the reservation carries fragments under that name.
+    with pytest.raises(ValueError, match="phase must be one of"):
+        server.extras(reservation(extras={"bootstrap": ["x;"]}), "bootstrap")
     assert PHASES == ("add", "remove")
+
+
+def test_a_raw_key_in_a_uri_is_an_unknown_key():
+    # Fragments belong to the reservation; a connection carries none.
+    with pytest.raises(dhcpctl.ConfigError, match="unknown key 'raw.dhcpd' in a dhcpd"):
+        dhcpctl.connect("dhcpd://dhcp01/?raw.dhcpd=a;")
 
 
 def test_a_subclass_can_decide_per_client(reservation):
@@ -204,8 +224,12 @@ def test_a_subclass_can_decide_per_client(reservation):
         def add(self, reservation):
             Ipxe.applied = self.extras(reservation, "add")
 
-    server = Ipxe("ipxe://host/?raw.ipxe=" + "authoritative;")
-    server.add(reservation(context={"image": "debian"}))
+    server = Ipxe("ipxe://host/")
+    extras = {"add": ["authoritative;"]}
+    debian = reservation(context={"image": "debian"}, extras=extras)
+    server.add(debian)
     assert Ipxe.applied == ["authoritative;", IPXE_DHCPD]
-    server.add(reservation(context={"image": "windows"}))
+    # The override appended to its own list, not the reservation's.
+    assert list(debian.extras["add"]) == ["authoritative;"]
+    server.add(reservation(context={"image": "windows"}, extras=extras))
     assert Ipxe.applied == ["authoritative;"]

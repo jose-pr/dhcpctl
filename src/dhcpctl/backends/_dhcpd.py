@@ -15,46 +15,51 @@ from __future__ import annotations
 
 import logging
 import re as _re
-from typing import Any, List, Optional
+import struct as _struct
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlsplit
+
+from pydhcp.options import Bytes, DomainList, OctetString, String
 
 from .._conditions import Condition
 from .._model import Reservation, Target
-from .._options import DHCPOptions
+from .._options import UNSPECIFIED, DHCPLease, DHCPOptionCode, plain_items
 from .._server import DEFAULT_OWNER, DHCPServer, Secrets
-from ..exceptions import BackendUnavailableError, ConfigError
+from ..exceptions import BackendUnavailableError, ConfigError, ServerError
 
 __all__ = ["DHCPDBackend", "render_condition", "render_statements"]
 
 LOGGER = logging.getLogger("dhcpctl")
 
-#: Generic name -> what dhcpd calls it. `filename`/`next-server` are statements
-#: in their own right; the rest are `option <name> <value>;`.
-_STATEMENTS = {"boot-file-name": "filename", "next-server": "next-server"}
+#: The lease's BOOTP header fields, by the dhcpd statement that sets each;
+#: `siaddr` is an address, the others text.
+_STATEMENTS = (
+    ("file", "filename"),
+    ("sname", "server-name"),
+    ("siaddr", "next-server"),
+)
+#: Option code -> dhcpd's name for it; any other code is `unknown-<n>`, which
+#: dhcpd(8) takes as opaque octets.
 _OPTIONS = {
-    "router": "routers",  # dhcpd's own spelling is plural
-    "domain-name-servers": "domain-name-servers",
-    "domain-name": "domain-name",
-    "domain-search": "domain-search",
-    "ntp-servers": "ntp-servers",
-    "subnet-mask": "subnet-mask",
-    "broadcast-address": "broadcast-address",
-    "lease-time": "dhcp-lease-time",
-    "tftp-server-name": "tftp-server-name",
-    "host-name": "host-name",
-    "vendor-class-identifier": "vendor-class-identifier",
+    DHCPOptionCode.ROUTER: "routers",  # dhcpd's own spelling is plural
+    DHCPOptionCode.DNS: "domain-name-servers",
+    DHCPOptionCode.DOMAIN_NAME: "domain-name",
+    DHCPOptionCode.DOMAIN_SEARCH: "domain-search",
+    DHCPOptionCode.NTP_SERVERS: "ntp-servers",
+    DHCPOptionCode.SUBNET_MASK: "subnet-mask",
+    DHCPOptionCode.BROADCAST_ADDRESS: "broadcast-address",
+    DHCPOptionCode.IP_ADDRESS_LEASE_TIME: "dhcp-lease-time",
+    DHCPOptionCode.TFTP_SERVER: "tftp-server-name",
+    DHCPOptionCode.BOOTFILE_NAME: "bootfile-name",
+    DHCPOptionCode.HOSTNAME: "host-name",
+    DHCPOptionCode.VENDOR_CLASS_IDENTIFIER: "vendor-class-identifier",
 }
-#: Values dhcpd expects as quoted text rather than as an address or a number.
-_TEXT = {
-    "filename",
-    "domain-name",
-    "domain-search",
-    "tftp-server-name",
-    "host-name",
-    "vendor-class-identifier",
-}
+
+#: pydhcp codecs whose values dhcpd takes as quoted text, not as an address or
+#: a number.
+_TEXT_CODECS = (String, OctetString, DomainList)
 #: What an unquoted value may contain: addresses, numbers, lists of them.
-_BARE = _re.compile(r"^[0-9a-fA-F.:, ]+$")
+_BARE = _re.compile(r"^(true|false|[0-9a-fA-F.:, ]+)$")
 
 
 class DHCPDBackend(DHCPServer):
@@ -69,12 +74,26 @@ class DHCPDBackend(DHCPServer):
     """
 
     SETTINGS = frozenset({"keyname", "keyfile", "conditions"})
+    #: dhcpd's spellings, so a dhcpd config's names (`routers`, `filename`) work.
+    OPTION_NAMES = {
+        **{
+            name: int(code)
+            for code, name in _OPTIONS.items()
+            if name.replace("-", "_").upper() not in DHCPOptionCode.__members__
+        },
+        **{name: field for field, name in _STATEMENTS if name != "next-server"},
+    }
     URI_SECRETS = {"username": "keyname", "password": "omapi_key"}
 
     def __init__(
-        self, uri: str, *, secrets: Secrets = None, owner: str = DEFAULT_OWNER
+        self,
+        uri: str,
+        *,
+        secrets: Secrets = None,
+        owner: str = DEFAULT_OWNER,
+        codes: Any = None,
     ) -> None:
-        super().__init__(uri, secrets=secrets, owner=owner)
+        super().__init__(uri, secrets=secrets, owner=owner, codes=codes)
         parts = urlsplit(uri)
         self.hostname = parts.hostname or "localhost"
         self.port = parts.port or 7911
@@ -119,13 +138,13 @@ class DHCPDBackend(DHCPServer):
         username = self.keyname.encode() if self.keyname else None
         key = secret.encode() if secret else None
         LOGGER.debug("omapi connect %s:%s", self.hostname, self.port)
-        return pypureomapi.Omapi(self.hostname, self.port, username, key, timeout=30)
+        return _connection_class(pypureomapi)(
+            self.hostname, self.port, username, key, timeout=30
+        )
 
     # -- the DHCPServer contract ------------------------------------------
 
     def add(self, reservation: Reservation) -> None:
-        target = reservation.target
-        mac = _mac(target)
         conditions = list(reservation.conditions.values())
         extras = self.extras(reservation, "add")
         group = None
@@ -135,62 +154,67 @@ class DHCPDBackend(DHCPServer):
             group = "-".join(c.name for c in conditions)
         elif conditions:
             extras = extras + [render_condition(c) for c in conditions]
-        statements = render_statements(reservation.options, extras)
+        if group is not None:
+            # A host's own statements outrank its group's, so what a condition
+            # overrides is the host's only when no condition matches.
+            statements = render_guarded(reservation.lease, conditions, extras)
+        else:
+            statements = render_statements(reservation.lease, extras)
+        host = _host(reservation)
         connection = self.omapi()
         try:
             if group is not None:
                 self._ensure_group(connection, group, conditions)
-            connection.add_host_supersede(
-                target.ip_text,
-                mac,
-                str(target.name),
-                statements=statements or None,
-            )
-            if group is not None:
-                # Set after the host exists: `change_group` takes the host name.
-                connection.change_group(str(target.name), group)
+            # The group is set in the same create: a host that exists, even for
+            # a moment, without it is a client served without its condition.
+            connection.create_host(*host, statements=statements, group=group)
         finally:
             _close(connection)
 
     def keep(self, reservation: Reservation) -> None:
-        """Supersede the host with the completion statements instead of deleting it.
+        """Rewrite the host with the completion's lease applied.
 
-        `add_host_supersede` writes the host whole, so there is no window where
-        the host has the installer's filename and the new statements half applied.
+        dhcpd refuses to create a host that exists, and OMAPI cannot replace a
+        host's statements in place, so the host is deleted and created again:
+        for that moment the client has no reservation, which is not a boot.
         """
-        target = reservation.target
-        options = reservation.completion.apply_to(reservation.options)
-        statements = render_statements(options, self.extras(reservation, "remove"))
+        statements = render_statements(
+            reservation.completion.apply_to(reservation.lease),
+            self.extras(reservation, "remove"),
+        )
+        self._rewrite(reservation, statements)
+
+    def _rewrite(self, reservation: Reservation, statements: str) -> None:
+        host = _host(reservation)
         connection = self.omapi()
         try:
-            connection.add_host_supersede(
-                target.ip_text,
-                _mac(target),
-                str(target.name),
-                statements=statements or None,
-            )
+            _delete_host(connection, host[1])
+            connection.create_host(*host, statements=statements)
         finally:
             _close(connection)
 
     def _ensure_group(
         self, connection: Any, group: str, conditions: List[Condition]
     ) -> None:
-        """Create the group carrying these conditions, unless it is already there.
+        """Use the group carrying these conditions, or create it.
 
-        OMAPI has no group lookup, so "already there" is what `add_group` raising
-        says. An OMAPI group does not survive a restart; `condition_recipe` prints
-        the `dhcpd.conf` block that does.
+        An OMAPI group does not survive a restart; `condition_recipe` prints the
+        `dhcpd.conf` block that does.
+
+        :raises ServerError: the group is not there and cannot be created.
         """
+        if connection.group_exists(group):
+            LOGGER.debug("dhcpd group %s already present", group)
+            return
         statements = " ".join(render_condition(c) for c in conditions)
         try:
             connection.add_group(group, statements)
         except Exception as exc:  # noqa: BLE001 - the library raises its own types
-            if "exist" not in str(exc).lower() and type(exc).__name__ not in (
-                "OmapiError",
-                "OmapiErrorNotFound",
-            ):
-                raise
-            LOGGER.debug("dhcpd group %s already present (%s)", group, exc)
+            raise ServerError(
+                f"dhcpd refused to create group {group!r} ({exc}); the host is not "
+                f"armed, because without the group it would be served without its "
+                f"conditions. Add the group to dhcpd.conf (see condition_recipe)."
+            ) from exc
 
     def ensure_condition(self, reservation: Reservation, condition: Condition) -> str:
         """dhcpd expresses a condition in the statements it already writes.
@@ -215,34 +239,91 @@ class DHCPDBackend(DHCPServer):
     ) -> None:
         """Drop the host out of its group, leaving the group for other hosts.
 
-        OMAPI has no "unset the group" operation; superseding the host without
-        one is the way.
+        OMAPI cannot unset a host's group, so the host is created again without
+        one, serving the reservation's own lease.
         """
         if self.conditions != "group":
             return
-        target = reservation.target
-        connection = self.omapi()
-        try:
-            connection.add_host_supersede(
-                target.ip_text,
-                _mac(target),
-                str(target.name),
-                statements=None,
-            )
-        finally:
-            _close(connection)
+        self._rewrite(
+            reservation,
+            render_statements(reservation.lease, self.extras(reservation, "add")),
+        )
 
     def remove(self, reservation: Reservation) -> None:
         mac = _mac(reservation.target)
         connection = self.omapi()
         try:
-            connection.del_host(mac)
-        except Exception as exc:  # noqa: BLE001 - the library's own not-found type
-            if type(exc).__name__ != "OmapiErrorNotFound":
-                raise
-            LOGGER.debug("omapi: no host for %s; nothing to remove", mac)
+            _delete_host(connection, mac)
         finally:
             _close(connection)
+
+
+def _host(reservation: Reservation) -> Tuple[str, str, str]:
+    """The host's address, MAC and name, as OMAPI takes them."""
+    ip = str(reservation.require_ip("a dhcpd host carries a fixed address"))
+    return ip, _mac(reservation.target), str(reservation.target.name)
+
+
+_CONNECTIONS: Dict[Any, type] = {}
+
+
+def _connection_class(pypureomapi: Any) -> type:
+    """pypureomapi's connection, with the two calls it lacks.
+
+    Made on first use, so importing this module needs no pypureomapi.
+    """
+    if pypureomapi.Omapi in _CONNECTIONS:
+        return _CONNECTIONS[pypureomapi.Omapi]
+
+    class Connection(pypureomapi.Omapi):
+        def create_host(
+            self,
+            ip: str,
+            mac: str,
+            name: str,
+            statements: str = "",
+            group: Optional[str] = None,
+        ) -> None:
+            """Create a host, in `group` when given; one that exists is refused.
+
+            :raises ServerError: dhcpd did not create it (a host with this name
+                or MAC exists, or a statement was refused).
+            """
+            message = pypureomapi.OmapiMessage.open(b"host")
+            message.message.append((b"create", _struct.pack("!I", 1)))
+            message.message.append((b"exclusive", _struct.pack("!I", 1)))
+            message.obj.append((b"name", name.encode("utf-8")))
+            message.obj.append((b"hardware-address", pypureomapi.pack_mac(mac)))
+            message.obj.append((b"hardware-type", _struct.pack("!I", 1)))
+            message.obj.append((b"ip-address", pypureomapi.pack_ip(ip)))
+            if group:
+                message.obj.append((b"group", group.encode("utf-8")))
+            if statements:
+                message.obj.append((b"statements", statements.encode("utf-8")))
+            if self.query_server(message).opcode != pypureomapi.OMAPI_OP_UPDATE:
+                raise ServerError(
+                    f"dhcpd refused to create host {name!r} ({ip}): it exists, "
+                    f"or a statement was refused"
+                )
+
+        def group_exists(self, name: str) -> bool:
+            """Does dhcpd hold a group by this name? An open without create."""
+            message = pypureomapi.OmapiMessage.open(b"group")
+            message.obj.append((b"name", name.encode("utf-8")))
+            return self.query_server(message).opcode == pypureomapi.OMAPI_OP_UPDATE
+
+    _CONNECTIONS[pypureomapi.Omapi] = Connection
+    return Connection
+
+
+def _delete_host(connection: Any, mac: str) -> None:
+    """Delete the host for `mac`; none is success, so cleanup can re-run."""
+    try:
+        connection.del_host(mac)
+    except Exception as exc:  # noqa: BLE001 - the library's own not-found type
+        if type(exc).__name__ != "OmapiErrorNotFound":
+            raise
+        LOGGER.debug("omapi: no host for %s; nothing to remove", mac)
 
 
 def _close(connection: Any) -> None:
@@ -272,6 +353,12 @@ def render_condition(condition: Condition) -> str:
     The body goes through the same renderer as the host's own options, so a
     conditional option cannot be escaped differently from an unconditional one.
     """
+    body = render_statements(condition.lease)
+    return "if " + _test(condition) + " { " + body + " }"
+
+
+def _test(condition: Condition) -> str:
+    """The dhcpd expression true for a client this condition matches."""
     tests = []
     for key, value in condition.match.items():
         text = str(value)
@@ -281,34 +368,103 @@ def render_condition(condition: Condition) -> str:
                 "newline, NUL or quote cannot appear in a dhcpd test"
             )
         tests.append(_CONDITION_TESTS[key].format(value=_quote_text(text)))
-    body = render_statements(condition.options)
-    return "if " + " and ".join(tests) + " { " + body + " }"
+    return " and ".join(tests)
 
 
-def render_statements(options: DHCPOptions, raw: Optional[List[Any]] = None) -> str:
-    """Render options as a dhcpd config fragment, escaping every value.
+#: The lease's header fields, by the key `_served` names them with.
+_FIELDS = ("file", "sname", "siaddr")
+
+
+def _served(lease: DHCPLease) -> List[Any]:
+    """What `lease` sets: its option codes, and the header fields it fills."""
+    keys: List[Any] = [int(code) for code in lease.options]
+    keys += [f for f in _FIELDS if f != "siaddr" and getattr(lease, f)]
+    if not lease.siaddr.is_unspecified:
+        keys.append("siaddr")
+    return keys
+
+
+def _part(lease: DHCPLease, keys: "set[Any]", keep: bool) -> DHCPLease:
+    """`lease` with only the `keys` (`keep`), or without them."""
+    options = lease.options.copy()
+    options.retain(code for code in options if (int(code) in keys) == keep)
+    fields = {
+        f: (
+            getattr(lease, f)
+            if (f in keys) == keep
+            else ("" if f != "siaddr" else UNSPECIFIED)
+        )
+        for f in _FIELDS
+    }
+    return lease.replace(options=options, **fields)
+
+
+def render_guarded(
+    lease: DHCPLease, conditions: List[Condition], extras: Optional[List[Any]] = None
+) -> str:
+    """A host's statements when its conditions live in a group.
+
+    dhcpd evaluates a host's statements after its group's, so each value a
+    condition overrides goes in the `else` of its conditions' tests, and the
+    group's conditional value wins for a client that matches. `else`, not
+    `if not`: a test on an option the client did not send is neither true nor
+    false, and `not` of it is not true either.
+    """
+    overriding: Dict[Any, Tuple[str, ...]] = {}
+    for condition in conditions:
+        for key in _served(condition.lease):
+            overriding[key] = overriding.get(key, ()) + (condition.name,)
+    by_name = {c.name: c for c in conditions}
+    guards: Dict[Tuple[str, ...], "set[Any]"] = {}
+    for key, names in overriding.items():
+        guards.setdefault(names, set()).add(key)
+    parts = [render_statements(_part(lease, set(overriding), keep=False))]
+    for names, keys in guards.items():
+        body = render_statements(_part(lease, keys, keep=True))
+        if body:
+            test = " or ".join(f"({_test(by_name[n])})" for n in names)
+            parts.append(f"if {test} {{ }} else {{ {body} }}")
+    parts.extend(str(line) for line in (extras or []))
+    return " ".join(part for part in parts if part)
+
+
+def render_statements(lease: DHCPLease, extras: Optional[List[Any]] = None) -> str:
+    """Render what `lease` serves as a dhcpd config fragment, escaping every value.
 
     `statements` is config *source*, so an unescaped value could end one
     statement and start another. Text values are quoted with `"` and `\\`
     escaped; anything meant to be an address or a number must look like one.
-    `raw` fragments are appended verbatim.
+    The options come first, then the header fields (`filename`, `server-name`,
+    `next-server`); `extras` are appended verbatim.
     """
     parts: List[str] = []
-    for name, value in options.items():
-        keyword = _STATEMENTS.get(name)
-        if keyword:
-            parts.append(f"{keyword} {_render(keyword, value)};")
+    for key, value in plain_items(lease.options):
+        codec = key.get_type()
+        text = issubclass(codec, _TEXT_CODECS)
+        if key not in _OPTIONS:
+            # dhcpd knows no name for it: `unknown-<n>` takes quoted text or
+            # the option's octets.
+            option = f"unknown-{int(key)}"
+            if not text:
+                raw = bytes(lease.options[int(key)]).hex()
+                value = ":".join(raw[i : i + 2] for i in range(0, len(raw), 2))
+            parts.append(f"option {option} {_render(option, value, text)};")
             continue
-        option = _OPTIONS.get(name)
-        if option is None:
-            if name.startswith("option-"):
-                option = f"dhcp-option-{name[len('option-'):]}"
-            elif name.isdigit():
-                option = f"dhcp-option-{name}"
-            else:  # pragma: no cover - unknown names are refused earlier
-                continue
-        parts.append(f"option {option} {_render(option, value)};")
-    parts.extend(str(line) for line in (raw or []))
+        if issubclass(codec, Bytes) and not text:
+            # dhcpd reads octets as colon-separated hex.
+            value = ":".join(value[i : i + 2] for i in range(0, len(value), 2))
+        elif isinstance(value, bool):
+            value = "true" if value else "false"
+        option = _OPTIONS[key]
+        parts.append(f"option {option} {_render(option, value, text)};")
+    for field, keyword in _STATEMENTS:
+        value = getattr(lease, field)
+        if field == "siaddr":
+            if not value.is_unspecified:
+                parts.append(f"{keyword} {_render(keyword, value, False)};")
+        elif value:
+            parts.append(f"{keyword} {_render(keyword, value, True)};")
+    parts.extend(str(line) for line in (extras or []))
     return " ".join(parts)
 
 
@@ -318,22 +474,22 @@ def _quote_text(text: str) -> str:
     return f'"{escaped}"'
 
 
-def _render(keyword: str, value: Any) -> str:
-    """One value, quoted or bare, never able to end its statement."""
+def _render(keyword: str, value: Any, text: bool) -> str:
+    """One value, quoted (`text`) or bare, never able to end its statement."""
     if isinstance(value, (list, tuple)):
-        return ", ".join(_render(keyword, item) for item in value)
-    text = str(value)
-    if any(ch in text for ch in "\r\n\x00"):
+        return ", ".join(_render(keyword, item, text) for item in value)
+    rendered = str(value)
+    if any(ch in rendered for ch in "\r\n\x00"):
         raise ConfigError(
             f"dhcpd option {keyword!r} value contains a newline or NUL, which "
-            "cannot be written into a dhcpd statement: " + repr(text)
+            "cannot be written into a dhcpd statement: " + repr(rendered)
         )
-    if keyword in _TEXT:
-        return _quote_text(text)
-    if not _BARE.match(text):
+    if text:
+        return _quote_text(rendered)
+    if not _BARE.match(rendered):
         raise ConfigError(
             f"dhcpd option {keyword!r} expects an address or number, got "
-            f"{text!r}; quote it as text by using a text option, or pass it "
-            "through raw.dhcpd if you know what dhcpd expects"
+            f"{rendered!r}; quote it as text by using a text option, or pass it "
+            "through the reservation's extras if you know what dhcpd expects"
         )
-    return text
+    return rendered

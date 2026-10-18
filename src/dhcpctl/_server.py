@@ -2,12 +2,27 @@
 
 from __future__ import annotations
 
-from typing import Any, Callable, ClassVar, FrozenSet, List, Mapping, Optional, Union
-from urllib.parse import unquote, urlsplit
+from typing import (
+    Any,
+    Callable,
+    ClassVar,
+    Dict,
+    FrozenSet,
+    List,
+    Mapping,
+    Optional,
+    Union,
+)
+from urllib.parse import parse_qsl, unquote, urlsplit
 
 from ._conditions import NAME_CHARS, Condition
 from ._model import Reservation
-from ._options import PHASES, DHCPOptions, split_query
+from ._options import (
+    PHASES,
+    PYDHCP_CODES,
+    OptionCodes,
+    option_codes,
+)
 from .exceptions import ConditionUnsupportedError, ConfigError
 
 __all__ = ["DHCPServer", "Secrets", "DEFAULT_OWNER"]
@@ -32,9 +47,13 @@ class DHCPServer:
     `complete` and `extras` are the same for every backend.
     """
 
-    #: Query keys this backend reads as connection settings. Every other key in
-    #: the query is a client option; the two sets stay disjoint.
+    #: The query keys this backend reads: how to reach the server, and nothing
+    #: else may be in a URI's query.
     SETTINGS: ClassVar[FrozenSet[str]] = frozenset()
+
+    #: The backend's own option spellings (`option_codes` declarations), under
+    #: whatever names the caller declares.
+    OPTION_NAMES: ClassVar[Mapping[str, Any]] = {}
 
     #: Which secret the URI's user and password parts supply.
     URI_SECRETS: ClassVar[Mapping[str, str]] = {
@@ -43,15 +62,32 @@ class DHCPServer:
     }
 
     def __init__(
-        self, uri: str, *, secrets: Secrets = None, owner: str = DEFAULT_OWNER
+        self,
+        uri: str,
+        *,
+        secrets: Secrets = None,
+        owner: str = DEFAULT_OWNER,
+        codes: Any = None,
     ) -> None:
         self.uri = uri
+        base = option_codes(self.OPTION_NAMES) if self.OPTION_NAMES else PYDHCP_CODES
+        #: The codemap this server reads option names with: the caller's
+        #: declarations over the backend's own spellings over pydhcp's.
+        self.codes = OptionCodes.of(codes).over(base)
         parts = urlsplit(uri)
-        #: The URI's scheme, which is also the name `raw.<name>` fragments use.
+        #: The URI's scheme.
         self.scheme = parts.scheme.lower()
-        self.settings, self.options, self.options_builder = split_query(
-            uri, self.SETTINGS, self.scheme
-        )
+        #: The backend's own query keys: a URI says only how to reach the server.
+        self.settings: Dict[str, str] = {}
+        for key, value in parse_qsl(parts.query, keep_blank_values=True):
+            if key not in self.SETTINGS:
+                raise ConfigError(
+                    f"unknown key {key!r} in a {self.scheme} connection: its query "
+                    f"takes only how to reach the server "
+                    f"({', '.join(sorted(self.SETTINGS)) or 'nothing'}); options "
+                    f"belong to the reservation"
+                )
+            self.settings[key] = value
         if not owner or set(owner) - NAME_CHARS:
             raise ConfigError(
                 f"owner {owner!r} may only contain letters, digits, '-' and '_'"
@@ -85,36 +121,22 @@ class DHCPServer:
         return f"{type(self).__name__}({self.redacted_uri!r})"
 
     def secret(self, key: str) -> Optional[str]:
-        """The secret named `key`: the URI's if it carries it, else the caller's.
+        """The secret named `key`: the caller's if it gives one, else the URI's.
 
-        The caller's `secrets` are asked when the value is needed, not at
-        construction. None when neither has it.
+        The caller's `secrets` override the URI's, so one URI serves several
+        logins; a caller's None leaves the URI's in place, and `""` is an empty
+        secret. They are asked when the value is needed, not at construction.
+        None when neither has it.
         """
-        if key in self._uri_secrets:
-            return self._uri_secrets[key]
         source = self._secrets
-        if source is None:
-            return None
+        given = None
         if callable(source):
-            return source(key)
-        return source.get(key)
-
-    def client_options(
-        self,
-        *layers: "Mapping[str, Any]",
-        defaults: "Optional[Mapping[str, Any]]" = None,
-    ) -> DHCPOptions:
-        """Options to serve, layered: `defaults`, this URI's options, then `layers`.
-
-        Later wins. The URI's `raw.*` fragments are carried along. The result is
-        what a `Reservation` takes as its `options`.
-        """
-        options = DHCPOptions(defaults or {})
-        options.update(self.options)
-        options.raw.update(self.options.raw)
-        for layer in layers:
-            options.update(layer)
-        return options
+            given = source(key)
+        elif source is not None:
+            given = source.get(key)
+        if given is not None:
+            return given
+        return self._uri_secrets.get(key)
 
     # -- what a backend implements --------------------------------------------
 
@@ -178,12 +200,10 @@ class DHCPServer:
     def extras(self, reservation: Reservation, phase: str = "add") -> List[Any]:
         """Backend-native fragments to apply with the reservation, verbatim.
 
-        The URI's `raw.<scheme>` fragments for `phase`, then the reservation's
-        own `extras[phase]`. A subclass may override this to decide fragments
-        per client (`reservation.context` is the caller's), calling `super()` to
-        keep these. What a fragment is belongs to the backend.
+        `reservation.extras[phase]`. A subclass may override this to decide
+        fragments per client (`reservation.context` is the caller's), calling
+        `super()` to keep these. What a fragment is belongs to the backend.
         """
         if phase not in PHASES:
             raise ValueError(f"phase must be one of {PHASES}, not {phase!r}")
-        lines = self.options.raw_for(self.scheme, phase)
-        return lines + list(reservation.extras.get(phase, ()))
+        return list(reservation.extras.get(phase, ()))

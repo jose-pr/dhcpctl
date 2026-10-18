@@ -27,8 +27,13 @@ classifiers = [
     "Typing :: Typed",
 ]
 dependencies = [
-    # MACAddress.format/hex and the address/network types every backend reads.
-    "netimps>=0.4.0,<0.5",
+    # MACAddress.format/hex and the address/network types every backend reads;
+    # 0.4.1 is the floor pydhcp needs.
+    "netimps>=0.4.1,<0.5",
+    # What is served: DHCPLease with its BOOTP boot fields and no-address form,
+    # DHCPOptions and its mapping form, OptionCodeEnum and resolve(), and the
+    # codecs that check each value and give netsh its data types (0.9.0).
+    "pydhcp>=0.9.0,<0.10",
     # dnsmasq's hosts/opts paths, local or a URI; the 0.1 series is the first
     # with the `uripath` import name.
     "pathapi>=0.1.0,<0.2",
@@ -43,9 +48,11 @@ kea = ["requests>=2.31,<3"]                    # kea:// and keas://
 dhcpd = ["pypureomapi>=0.8,<2"]                # dhcpd:// over OMAPI
 winrm = ["pywinrm>=0.5.0,<0.6"]                # windhcp://...?transport=winrm
 ssh = ["sftppath[uri,paramiko]>=0.1.0,<0.2"]   # dnsmasq paths over sftp://
+# Reservation.to_text/from_text as YAML, TOML or INI; JSON needs nothing.
+formats = ["pydhcp[pktcap]", "pktcap[yaml,toml]>=0.1.1,<0.2"]
 dev = [
-    # Every backend extra, so their tests run rather than skip.
-    "pydhcpctl[kea,dhcpd,winrm,ssh]",
+    # Every extra, so their tests run rather than skip.
+    "pydhcpctl[kea,dhcpd,winrm,ssh,formats]",
     "black",
     "build",
     "pytest",
