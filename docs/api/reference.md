@@ -24,11 +24,16 @@
 
 ::: dhcpctl.Scope
 
-## Options
+## What is served
 
-::: dhcpctl.DHCPOptions
+`dhcpctl.DHCPLease`, `dhcpctl.DHCPOptions` and `dhcpctl.DHCPOptionCode` are
+pydhcp's, re-exported: see [pydhcp's reference](https://jose-pr.github.io/pydhcp/).
 
-::: dhcpctl.is_option
+::: dhcpctl.OptionCodes
+
+::: dhcpctl.option_codes
+
+::: dhcpctl.plain_items
 
 ## Conditions and completion
 

@@ -1,14 +1,17 @@
 # Backends
 
-A server is a URI. Its **scheme** picks the backend; its **query string**
-carries that backend's connection settings and, for every other key, the DHCP
-options to serve. A key that depends on the client (`boot-file-name`,
-`next-server`, `tftp-server-name`, `host-name`, `subnet_id`, `scope`) is refused
-in a URI and belongs in the reservation.
+A server is a URI. Its **scheme** picks the backend, and its **query string**
+says only how to reach the server: the backend's connection settings below,
+nothing else. What to serve belongs to each reservation: a pydhcp `DHCPLease`,
+its options named as [pydhcp](https://github.com/jose-pr/pydhcp) names them
+(`router`, `dns`, `bootfile-name`, `option-<n>`) or by an alias, beside the
+BOOTP header fields `siaddr` (`next-server`), `sname` and `file` (the boot
+file), which are not options: each backend writes them as its server spells
+the fields.
 
 | Scheme | Server | How it applies a reservation | Install |
 | --- | --- | --- | --- |
-| `dnsmasq://` | dnsmasq | writes `dhcp-host` / `dhcp-option` files, local or over `sftp://` | nothing locally; `pydhcpctl[ssh]` for remote paths |
+| `dnsmasq://` | dnsmasq | writes `--dhcp-hostsfile` / `--dhcp-optsfile` entries, local or over `sftp://` | nothing locally; `pydhcpctl[ssh]` for remote paths |
 | `kea://`, `keas://` | ISC Kea | `reservation-add` / `reservation-del` via the control agent | `pydhcpctl[kea]` |
 | `dhcpd://` | ISC dhcpd | an OMAPI host object | `pydhcpctl[dhcpd]` |
 | `windhcp://` | Windows DHCP | its PowerShell cmdlets *or* `netsh`, locally, over ssh or WinRM | nothing locally or over ssh; `pydhcpctl[winrm]` for WinRM |
@@ -16,9 +19,11 @@ in a URI and belongs in the reservation.
 ## What is easy to get wrong
 
 - **dnsmasq** re-reads `--dhcp-hostsfile` / `--dhcp-optsfile` only on SIGHUP and
-  never re-reads its main config, but `--dhcp-hostsdir` / `--dhcp-optsdir` pick
-  up changed files by themselves — which is why a directory needs no `reload=`
-  and a plain file does.
+  never re-reads its main config. `--dhcp-hostsdir` / `--dhcp-optsdir` read a
+  new file by themselves but only ever add: a removed or changed entry is
+  served until SIGHUP. So a directory arms with no `reload=`, and removing or
+  keeping a client signals `pidfile=` (or runs `reload=`, which a remote host
+  needs); a plain file needs `reload=` every time. Options need `optsfile=`.
 - **Kea** needs the `host_cmds` hook loaded *and* a writable hosts backend; a
   file-only Kea loads the hook and still refuses.
 - **dhcpd** hosts added over OMAPI do not survive a restart by themselves —
@@ -48,9 +53,8 @@ script.
 
 ## Extra fragments
 
-`raw.<scheme>=` in the query (or `raw.<scheme>.remove=` for teardown), a
-reservation's `extras`, or a subclass overriding `extras()` adds text no option
-models. It is emitted **verbatim**, after the modelled options:
+A reservation's `extras` (by phase: `add`, or `remove` for teardown), or a
+subclass overriding `extras()`, adds text no option models. It is emitted **verbatim**, after the modelled options:
 
 | Backend | A fragment is | Where it lands |
 | --- | --- | --- |

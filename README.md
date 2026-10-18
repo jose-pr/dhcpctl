@@ -8,8 +8,8 @@
 
 One interface to DHCP servers: **arm a reservation** for a client on dnsmasq,
 ISC Kea, ISC dhcpd or Windows DHCP, then **remove it or keep it** without its
-boot options. A server is a URI; its scheme picks the backend and its query
-carries both the connection settings and the DHCP options to serve.
+boot options. A server is a URI: its scheme picks the backend and its query says how to
+reach it. The options to serve belong to each reservation.
 Documentation: <https://jose-pr.github.io/dhcpctl/>.
 
 ## Features
@@ -17,9 +17,12 @@ Documentation: <https://jose-pr.github.io/dhcpctl/>.
 - **Four servers, one call** — `add`, `remove`, `complete` on dnsmasq (files,
   local or over `sftp://`), Kea (control agent), dhcpd (OMAPI) and Windows DHCP
   (PowerShell cmdlets or netsh, locally, over ssh or WinRM).
-- **One option vocabulary** — `router`, `boot-file-name`, `next-server`,
-  `option-<n>`, ...; each backend translates them, and backend-native text rides
-  through untouched (`raw.<scheme>=`).
+- **pydhcp's lease** — what a client is served is a [pydhcp](https://github.com/jose-pr/pydhcp)
+  `DHCPLease`: its address, its `DHCPOptions` named by pydhcp's registry
+  (`router`, `dns`, `option-<n>`) or an alias, each value read by its pydhcp
+  codec before any server sees it, and the BOOTP header fields (`next-server`,
+  `file`); each backend translates them, and backend-native text in a
+  reservation's `extras` rides through untouched.
 - **Conditions** — options served only to clients that match a test (the iPXE
   chainload), as a Windows policy, a dhcpd `if` or group, or a Kea client class;
   a backend that cannot express one refuses rather than arming without it, and
@@ -32,6 +35,9 @@ Documentation: <https://jose-pr.github.io/dhcpctl/>.
 - **Nothing required** — each backend's library is an extra, imported only when
   its scheme is used; secrets come from the URI or the caller, and a password
   is masked wherever a server is shown.
+- **Reservations as documents** — `Reservation.to_mapping` / `from_mapping`
+  and `to_text` / `from_text` (JSON, YAML, TOML, INI) round-trip a reservation
+  through pydhcp's own option form.
 - **Pluggable** — a backend is a `DHCPServer` subclass registered for a scheme,
   directly or through the `dhcpctl.backends` entry point.
 
@@ -50,25 +56,29 @@ The distribution is `pydhcpctl`; the import package is `dhcpctl`.
 | `dhcpd://` | ISC dhcpd over OMAPI | `pydhcpctl[dhcpd]` (pypureomapi) |
 | `windhcp://` | Windows DHCP | nothing locally or over ssh; `pydhcpctl[winrm]` (pywinrm) |
 
+`pydhcpctl[formats]` adds YAML, TOML and INI to `Reservation.to_text` /
+`from_text` (JSON needs nothing).
+
 Python 3.9 or later.
 
 ## Usage
 
 ```python
 import dhcpctl
-from ipaddress import ip_address, ip_network
+from ipaddress import ip_network
 
 from netimps import MACAddress
 
-server = dhcpctl.connect("kea://kea01:8000/?service=dhcp4&router=10.0.0.1")
+server = dhcpctl.connect("kea://kea01:8000/?service=dhcp4")  # how to reach it, nothing else
 
+# Options by name, and the BOOTP header fields beside them (not options).
+lease = server.codes.lease(
+    {"router": "10.0.0.1", "file": "undionly.kpxe", "next-server": "10.0.0.2"}
+)
 reservation = dhcpctl.Reservation(
-    target=dhcpctl.Target(
-        "web01", mac=MACAddress("aa:bb:cc:dd:ee:ff"), ip=ip_address("10.0.0.10")
-    ),
+    target=dhcpctl.Target("web01", mac=MACAddress("aa:bb:cc:dd:ee:ff")),
     scope=dhcpctl.Scope("lan", network=ip_network("10.0.0.0/24")),
-    # The URI's options, then these; later wins.
-    options=server.client_options({"boot-file-name": "undionly.kpxe"}),
+    lease=lease.replace(ip="10.0.0.10"),
     completion=dhcpctl.Completion(keep=True),  # keep the address when done
 )
 
@@ -82,7 +92,7 @@ A condition serves different options to clients that match a test:
 import dataclasses
 
 conditions = dhcpctl.parse_conditions(
-    {"ipxe": {"match": {"user-class": "iPXE"}, "options": {"boot-file-name": "boot.ipxe"}}}
+    {"ipxe": {"match": {"user-class": "iPXE"}, "options": {"file": "boot.ipxe"}}}
 )
 server.add(dataclasses.replace(reservation, conditions=conditions))
 print(server.condition_recipe(reservation, conditions["ipxe"]))  # what an admin applies
