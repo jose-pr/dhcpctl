@@ -32,5 +32,4 @@ def main(argv: "Optional[Sequence[str]]" = None) -> int:
 
     from ._root import Dhcpctl
 
-    status = duho.main(Dhcpctl, argv)
-    return 0 if status is None else int(status)
+    return duho.run(Dhcpctl, argv, exit="parse")

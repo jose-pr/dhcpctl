@@ -119,3 +119,28 @@ def test_an_option_value_can_be_json():
     assert parse_option("lease-time=json:600") == ("lease-time", 600)
     assert parse_option("dns=a, b") == ("dns", ["a", "b"])
     assert parse_option("file=x") == ("file", "x")
+
+
+def test_help_and_a_usage_error_still_raise_system_exit(capsys):
+    with pytest.raises(SystemExit) as shown:
+        main(["--help"])
+    assert shown.value.code == 0
+    with pytest.raises(SystemExit) as shown:
+        main(["render"])
+    assert shown.value.code == 2
+
+
+def test_ctrl_c_is_status_130_and_a_closed_pipe_status_1(monkeypatch):
+    from dhcpctl.cli.render import Render
+
+    def interrupted(self):
+        raise KeyboardInterrupt
+
+    def closed(self):
+        raise BrokenPipeError
+
+    argv = ["render", "dhcpd://dhcp01/", *CLIENT]
+    monkeypatch.setattr(Render, "__call__", interrupted)
+    assert main(argv) == 130
+    monkeypatch.setattr(Render, "__call__", closed)
+    assert main(argv) == 1
