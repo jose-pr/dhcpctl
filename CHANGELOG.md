@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-10-22
+
 ### Changed
 
 - The command line ends through `duho.run`: Ctrl-C ends with status 130 and a closed
@@ -148,5 +150,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `BackendUnavailableError`, `MissingMACError`, `ServerError`,
   `ConditionUnsupportedError`, `ConditionMissingError`.
 
-[Unreleased]: https://github.com/jose-pr/dhcpctl/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/jose-pr/dhcpctl/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/jose-pr/dhcpctl/releases/tag/v0.1.1
 [0.1.0]: https://github.com/jose-pr/dhcpctl/releases/tag/v0.1.0

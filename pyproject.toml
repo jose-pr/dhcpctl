@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "pydhcpctl"
-version = "0.1.0"
+version = "0.1.1"
 authors = [{ name = "jose-pr" }]
 description = "One interface to DHCP servers: arm a reservation on dnsmasq, Kea, ISC dhcpd or Windows DHCP, then remove or keep it."
 readme = "README.md"
