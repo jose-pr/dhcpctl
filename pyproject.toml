@@ -53,7 +53,7 @@ winrm = ["hostctl[winrm]>=0.4.0,<0.5"]         # windhcp://...?transport=winrm
 # windhcp over ssh, and a remote dnsmasq: its sftp:// paths and its reload.
 ssh = ["hostctl[ssh]>=0.4.0,<0.5", "sftppath[uri]>=0.1.3,<0.2"]
 # The `dhcpctl` command line; importing dhcpctl never needs it.
-cli = ["duho>=0.7.6,<0.8"]
+cli = ["duho>=0.7.8,<0.8"]
 # Reservation.to_text/from_text as YAML, TOML or INI; JSON needs nothing.
 formats = ["pydhcp[pktcap]", "pktcap[yaml,toml]>=0.1.1,<0.2"]
 dev = [

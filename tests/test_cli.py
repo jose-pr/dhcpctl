@@ -144,3 +144,14 @@ def test_ctrl_c_is_status_130_and_a_closed_pipe_status_1(monkeypatch):
     assert main(argv) == 130
     monkeypatch.setattr(Render, "__call__", closed)
     assert main(argv) == 1
+
+
+def test_backends_prints_a_table_or_json_by_format(capsys):
+    assert main(["backends"]) == 0
+    table = capsys.readouterr().out
+    assert "dhcpd " in table and not table.startswith("[")
+    assert main(["backends", "--format", "json"]) == 0
+    by_format = capsys.readouterr().out
+    assert main(["backends", "--json"]) == 0
+    assert capsys.readouterr().out == by_format
+    assert by_format.startswith("[\n  {\n")

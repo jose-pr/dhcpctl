@@ -498,7 +498,7 @@ line naming it. `import dhcpctl` never imports `dhcpctl.cli`.
 - `dhcpctl add|complete [--keep]|remove URI <reservation>` — the operation,
   then one line saying what was done.
 - `dhcpctl recipe URI --from DOC` — `condition_recipe` per condition.
-- `dhcpctl backends [--json]` — scheme, class and `SETTINGS` of each backend.
+- `dhcpctl backends [--format {text,json}] [--json]` — scheme, class and `SETTINGS` of each backend.
 
 `<reservation>` is `-n NAME [-m MAC] [--ip IP] [--hostname H] [--network CIDR]
 [--subnet-id N] [--scope-id S] [-o name=value]...` (a comma in a value makes a

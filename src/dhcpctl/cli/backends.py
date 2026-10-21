@@ -2,23 +2,17 @@
 
 from __future__ import annotations
 
-import json
-
-from duho import Cmd
+from duho import Cmd, OutputArgs
 
 from .._registry import backend_names, get_backend
 
 __all__ = ["Backends"]
 
 
-class Backends(Cmd):
+class Backends(OutputArgs, Cmd):
     """List the registered backends: scheme, class and the settings its URI takes."""
 
     _parsername_ = "backends"
-
-    as_json: bool = False
-    "Print a JSON list of {scheme, class, settings} instead of a table"
-    ("--json",)
 
     def __call__(self) -> int:
         rows = []
@@ -31,9 +25,12 @@ class Backends(Cmd):
                     "settings": sorted(backend.SETTINGS),
                 }
             )
-        if self.as_json:
-            print(json.dumps(rows, indent=2))
-            return 0
-        for row in rows:
-            print(f"{row['scheme']:10} {row['class']:45} {', '.join(row['settings'])}")
+        self._output_(rows, text=_table)
         return 0
+
+
+def _table(rows: list) -> str:
+    return "\n".join(
+        f"{row['scheme']:10} {row['class']:45} {', '.join(row['settings'])}"
+        for row in rows
+    )

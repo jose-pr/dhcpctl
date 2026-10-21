@@ -12,6 +12,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - The command line ends through `duho.run`: Ctrl-C ends with status 130 and a closed
   standard output with status 1, both without a traceback. `--help`, `--version` and a
   usage error still raise `SystemExit`.
+- `dhcpctl backends` takes `--format {text,json}` besides `--json`, which prints the same
+  JSON as before; the help text of `--json` now reads "Same as --format json".
+- The `cli` extra requires `duho>=0.7.8,<0.8`.
 
 ## [0.1.0] - 2026-10-19
 
